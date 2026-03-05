@@ -109,13 +109,17 @@ class FilesystemAdapterSync(FilesystemSync):
         logger.debug("Reading file as bytes: %s", path)
         try:
             request_data = self._build_download_request(path, range_header)
-            request_kwargs: dict[str, dict[str, str]] = {
-                "headers": request_data["headers"],
-            }
-            if request_data["params"] is not None:
-                request_kwargs["params"] = request_data["params"]
-
-            response = self._httpx_client.get(request_data["url"], **request_kwargs)
+            if request_data["params"] is None:
+                response = self._httpx_client.get(
+                    request_data["url"],
+                    headers=request_data["headers"],
+                )
+            else:
+                response = self._httpx_client.get(
+                    request_data["url"],
+                    headers=request_data["headers"],
+                    params=request_data["params"],
+                )
             response.raise_for_status()
             return response.content
         except Exception as e:
@@ -131,11 +135,15 @@ class FilesystemAdapterSync(FilesystemSync):
         params = request_data["params"]
         headers = request_data["headers"]
 
-        request_kwargs: dict[str, dict[str, str]] = {"headers": headers}
-        if params is not None:
-            request_kwargs["params"] = params
-
-        request = self._httpx_client.build_request("GET", url, **request_kwargs)
+        if params is None:
+            request = self._httpx_client.build_request("GET", url, headers=headers)
+        else:
+            request = self._httpx_client.build_request(
+                "GET",
+                url,
+                headers=headers,
+                params=params,
+            )
         response = self._httpx_client.send(request, stream=True)
 
         if response.status_code >= 300:

@@ -159,13 +159,17 @@ class FilesystemAdapter(Filesystem):
             request_data = self._build_download_request(path, range_header)
             client = await self._get_httpx_client()
 
-            request_kwargs: dict[str, dict[str, str]] = {
-                "headers": request_data["headers"],
-            }
-            if request_data["params"] is not None:
-                request_kwargs["params"] = request_data["params"]
-
-            response = await client.get(request_data["url"], **request_kwargs)
+            if request_data["params"] is None:
+                response = await client.get(
+                    request_data["url"],
+                    headers=request_data["headers"],
+                )
+            else:
+                response = await client.get(
+                    request_data["url"],
+                    headers=request_data["headers"],
+                    params=request_data["params"],
+                )
             response.raise_for_status()
             return response.content
         except Exception as e:
@@ -189,13 +193,15 @@ class FilesystemAdapter(Filesystem):
             params = request_data["params"]
             headers = request_data["headers"]
 
-            request_kwargs: dict[str, dict[str, str]] = {
-                "headers": headers,
-            }
-            if params is not None:
-                request_kwargs["params"] = params
-
-            request = client.build_request("GET", url, **request_kwargs)
+            if params is None:
+                request = client.build_request("GET", url, headers=headers)
+            else:
+                request = client.build_request(
+                    "GET",
+                    url,
+                    headers=headers,
+                    params=params,
+                )
 
             response = await client.send(request, stream=True)
 
