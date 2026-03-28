@@ -308,7 +308,7 @@ func TestPTYSession_ControllerCRUD(t *testing.T) {
 
 	got := c.GetPTYSession(id)
 	require.NotNil(t, got)
-	require.Equal(t, id, got.id)
+	require.Equal(t, id, got.(*ptySession).id)
 
 	running, offset, err := c.GetPTYSessionStatus(id)
 	require.NoError(t, err)

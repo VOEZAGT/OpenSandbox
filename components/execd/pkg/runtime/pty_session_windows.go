@@ -26,6 +26,25 @@ import (
 // All methods the controller layer calls must be present here so Windows cross-compilation succeeds.
 type ptySession struct{}
 
+// PTYSession is the public interface for an interactive PTY/pipe session.
+// The concrete implementation (*ptySession) is unexported; callers outside
+// this package must use this interface.
+type PTYSession interface {
+	LockWS() bool
+	UnlockWS()
+	IsRunning() bool
+	IsPTY() bool
+	ExitCode() int
+	Done() <-chan struct{}
+	StartPTY() error
+	StartPipe() error
+	WriteStdin(p []byte) (int, error)
+	AttachOutput() (io.Reader, io.Reader, func())
+	AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64)
+	SendSignal(name string)
+	ResizePTY(cols, rows uint16) error
+}
+
 var errPTYSessionNotSupported = errors.New("pty session is not supported on windows")
 
 // IsPTYSessionSupported reports whether PTY sessions are supported on this platform.
@@ -35,10 +54,10 @@ func IsPTYSessionSupported() bool { return false }
 func NewPTYSessionID() string { return "" }
 
 // CreatePTYSession is not supported on Windows.
-func (c *Controller) CreatePTYSession(id, cwd string) *ptySession { return nil } //nolint:revive
+func (c *Controller) CreatePTYSession(id, cwd string) PTYSession { return nil } //nolint:revive
 
 // GetPTYSession is not supported on Windows.
-func (c *Controller) GetPTYSession(id string) *ptySession { return nil } //nolint:revive
+func (c *Controller) GetPTYSession(id string) PTYSession { return nil } //nolint:revive
 
 // DeletePTYSession is not supported on Windows.
 func (c *Controller) DeletePTYSession(id string) error { //nolint:revive

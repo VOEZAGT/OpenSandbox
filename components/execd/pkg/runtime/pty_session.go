@@ -34,6 +34,25 @@ import (
 
 var errPTYSessionNotSupported = errors.New("pty session not supported")
 
+// PTYSession is the public interface for an interactive PTY/pipe session.
+// The concrete implementation (*ptySession) is unexported; callers outside
+// this package must use this interface.
+type PTYSession interface {
+	LockWS() bool
+	UnlockWS()
+	IsRunning() bool
+	IsPTY() bool
+	ExitCode() int
+	Done() <-chan struct{}
+	StartPTY() error
+	StartPipe() error
+	WriteStdin(p []byte) (int, error)
+	AttachOutput() (io.Reader, io.Reader, func())
+	AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64)
+	SendSignal(name string)
+	ResizePTY(cols, rows uint16) error
+}
+
 // IsPTYSessionSupported reports whether PTY sessions are supported on this platform.
 func IsPTYSessionSupported() bool { return true }
 
@@ -525,15 +544,16 @@ func (s *ptySession) close() {
 }
 
 // CreatePTYSession creates a new PTY session and stores it in the map.
-func (c *Controller) CreatePTYSession(id, cwd string) *ptySession {
+func (c *Controller) CreatePTYSession(id, cwd string) PTYSession {
 	s := newPTYSession(id, cwd)
 	c.ptySessionMap.Store(id, s)
 	log.Info("created pty session %s", id)
 	return s
 }
 
-// GetPTYSession looks up a PTY session by ID. Returns nil if not found.
-func (c *Controller) GetPTYSession(id string) *ptySession {
+// getPTYSession looks up a PTY session by ID. Returns nil if not found.
+// For internal use only; outside callers should use GetPTYSession.
+func (c *Controller) getPTYSession(id string) *ptySession {
 	if v, ok := c.ptySessionMap.Load(id); ok {
 		if s, ok := v.(*ptySession); ok {
 			return s
@@ -542,10 +562,19 @@ func (c *Controller) GetPTYSession(id string) *ptySession {
 	return nil
 }
 
+// GetPTYSession looks up a PTY session by ID. Returns nil if not found.
+func (c *Controller) GetPTYSession(id string) PTYSession {
+	s := c.getPTYSession(id)
+	if s == nil {
+		return nil
+	}
+	return s
+}
+
 // DeletePTYSession terminates and removes a PTY session.
 // Returns ErrContextNotFound if the session does not exist.
 func (c *Controller) DeletePTYSession(id string) error {
-	s := c.GetPTYSession(id)
+	s := c.getPTYSession(id)
 	if s == nil {
 		return ErrContextNotFound
 	}
@@ -557,7 +586,7 @@ func (c *Controller) DeletePTYSession(id string) error {
 
 // GetPTYSessionStatus returns status information for a PTY session.
 func (c *Controller) GetPTYSessionStatus(id string) (running bool, outputOffset int64, err error) {
-	s := c.GetPTYSession(id)
+	s := c.getPTYSession(id)
 	if s == nil {
 		return false, 0, ErrContextNotFound
 	}
