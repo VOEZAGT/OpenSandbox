@@ -72,7 +72,6 @@ from opensandbox_server.services.docker_windows_profile import (
     is_windows_platform,
     normalize_bootstrap_command,
     resolve_docker_platform,
-    resolve_windows_execd_download_url,
     validate_windows_runtime_prerequisites,
 )
 from opensandbox_server.services.extension_service import ExtensionService
@@ -1154,15 +1153,9 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
         mem_limit, nano_cpus = self._resolve_resource_limits(request)
         egress_token: Optional[str] = None
         requested_windows_profile = is_windows_platform(request.platform)
-        windows_execd_download_url: Optional[str] = None
 
         if requested_windows_profile:
             validate_windows_runtime_prerequisites()
-            windows_execd_download_url = resolve_windows_execd_download_url(
-                request.env,
-                self.execd_image,
-                request.platform.arch if request.platform is not None else None,
-            )
 
         # Prepare OSSFS mounts first so binds can reference mounted host paths.
         ossfs_mount_keys = self._prepare_ossfs_mounts(request.volumes)
@@ -1241,7 +1234,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
                 host_config_kwargs,
                 exposed_ports,
                 request.platform,
-                windows_execd_download_url=windows_execd_download_url,
             )
         except Exception:
             if sidecar_container is not None:
@@ -2301,7 +2293,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
         host_config_kwargs: Dict[str, Any],
         exposed_ports: Optional[list[str]],
         platform: Optional[PlatformSpec],
-        windows_execd_download_url: Optional[str] = None,
     ):
         requested_windows_platform = is_windows_platform(platform)
         bootstrap_command = normalize_bootstrap_command(
@@ -2357,7 +2348,6 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
                 install_windows_oem_scripts(
                     container=container,
                     sandbox_id=sandbox_id,
-                    windows_execd_download_url=windows_execd_download_url,
                     install_bat_bytes=install_bat_bytes,
                     ensure_directory=self._ensure_directory,
                     docker_operation=self._docker_operation,

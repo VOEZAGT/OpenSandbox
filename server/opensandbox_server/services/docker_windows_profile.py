@@ -24,7 +24,6 @@ from __future__ import annotations
 import io
 import logging
 import os
-import re
 import tarfile
 import time
 from threading import Lock
@@ -41,10 +40,7 @@ if TYPE_CHECKING:
 
 WINDOWS_REQUIRED_DEVICES = ("/dev/kvm", "/dev/net/tun")
 WINDOWS_REQUIRED_CAP_ADD = ("NET_ADMIN", "NET_RAW")
-WINDOWS_EXECD_DOWNLOAD_URL_ENV = "EXECD_DOWNLOAD_URL"
 WINDOWS_USER_PORTS_ENV = "USER_PORTS"
-DEFAULT_WINDOWS_EXECD_RELEASE_TAG = "v1.0.11"
-DEFAULT_WINDOWS_EXECD_ARCH = "amd64"
 
 
 def is_windows_platform(platform: Optional["PlatformSpec"]) -> bool:
@@ -137,79 +133,6 @@ def validate_windows_runtime_prerequisites() -> None:
             ),
         },
     )
-
-
-def _normalize_windows_arch(arch: Optional[str]) -> str:
-    if not arch:
-        return DEFAULT_WINDOWS_EXECD_ARCH
-    normalized = arch.strip().lower()
-    if normalized in {"amd64", "x86_64"}:
-        return "amd64"
-    if normalized in {"arm64", "aarch64"}:
-        return "arm64"
-    return DEFAULT_WINDOWS_EXECD_ARCH
-
-
-def _extract_image_tag(image_ref: str) -> Optional[str]:
-    image_without_digest = image_ref.split("@", 1)[0]
-    last_slash = image_without_digest.rfind("/")
-    last_colon = image_without_digest.rfind(":")
-    if last_colon <= last_slash:
-        return None
-    tag = image_without_digest[last_colon + 1 :].strip()
-    return tag or None
-
-
-def _build_windows_execd_download_url(release_tag: str, arch: str) -> str:
-    # return (
-    #     "https://github.com/alibaba/OpenSandbox/releases/download/"
-    #     f"docker%2Fexecd%2F{release_tag}/execd_{release_tag}_windows_{arch}.exe"
-    # )
-    return (
-        "https://github.com/alibaba/OpenSandbox/releases/download/"
-        f"docker%2Fexecd%2Fv1.0.11/execd_v1.0.11_windows_amd64.exe"
-    )
-
-
-def _is_release_tag(tag: str) -> bool:
-    return bool(re.match(r"^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$", tag))
-
-
-def resolve_windows_execd_download_url(
-    env: Optional[dict[str, Optional[str]]],
-    execd_image: str,
-    platform_arch: Optional[str],
-) -> str:
-    if not env:
-        override = None
-    else:
-        override = env.get(WINDOWS_EXECD_DOWNLOAD_URL_ENV)
-    if override is not None:
-        cleaned = override.strip()
-        if cleaned:
-            return cleaned
-
-    extracted_tag = _extract_image_tag(execd_image)
-    if extracted_tag and not _is_release_tag(extracted_tag):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": SandboxErrorCodes.INVALID_PARAMETER,
-                "message": (
-                    f"Windows profile requires a release-like execd image tag, got '{extracted_tag}'. "
-                    "Use an image tag like v1.0.11 or provide EXECD_DOWNLOAD_URL explicitly."
-                ),
-            },
-        )
-    release_tag = extracted_tag or DEFAULT_WINDOWS_EXECD_RELEASE_TAG
-    arch = _normalize_windows_arch(platform_arch)
-    return _build_windows_execd_download_url(release_tag, arch)
-
-
-def escape_batch_env_value(value: str) -> str:
-    # Batch script escapes: percent signs must be doubled.
-    return value.replace("%", "%%")
-
 
 def apply_windows_runtime_host_config_defaults(
     host_config_kwargs: dict,
@@ -323,39 +246,23 @@ def install_windows_oem_scripts(
     *,
     container,
     sandbox_id: str,
-    windows_execd_download_url: Optional[str],
     install_bat_bytes: bytes,
     ensure_directory: Callable[[object, str, Optional[str]], None],
     docker_operation: Callable[[str, Optional[str]], object],
 ) -> None:
     """
-    Install OEM scripts for dockur/windows:
-    - C:\\OEM\\install.bat wrapper with EXECD_DOWNLOAD_URL override
-    - C:\\OEM\\opensandbox-install.bat from execd image
+    Install OEM script for dockur/windows:
+    - C:\\OEM\\install.bat from execd image
     """
     ensure_directory(container, "/oem", sandbox_id)
-    safe_url = escape_batch_env_value(windows_execd_download_url or "")
-    wrapper_content = (
-        "@echo off\r\n"
-        "setlocal enableextensions\r\n"
-        f"set \"EXECD_DOWNLOAD_URL={safe_url}\"\r\n"
-        "call \"C:\\OEM\\opensandbox-install.bat\"\r\n"
-        "exit /b %errorlevel%\r\n"
-    ).encode("utf-8")
 
     tar_stream = io.BytesIO()
     with tarfile.open(fileobj=tar_stream, mode="w") as tar:
-        wrapper = tarfile.TarInfo(name="oem/install.bat")
-        wrapper.mode = 0o644
-        wrapper.size = len(wrapper_content)
-        wrapper.mtime = int(time.time())
-        tar.addfile(wrapper, io.BytesIO(wrapper_content))
-
-        base_script = tarfile.TarInfo(name="oem/opensandbox-install.bat")
-        base_script.mode = 0o644
-        base_script.size = len(install_bat_bytes)
-        base_script.mtime = int(time.time())
-        tar.addfile(base_script, io.BytesIO(install_bat_bytes))
+        install_script = tarfile.TarInfo(name="oem/install.bat")
+        install_script.mode = 0o644
+        install_script.size = len(install_bat_bytes)
+        install_script.mtime = int(time.time())
+        tar.addfile(install_script, io.BytesIO(install_bat_bytes))
     tar_stream.seek(0)
     try:
         with docker_operation("install windows OEM scripts", sandbox_id):

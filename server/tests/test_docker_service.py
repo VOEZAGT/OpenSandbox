@@ -1237,18 +1237,19 @@ async def test_create_sandbox_windows_profile_injects_runtime_defaults(mock_dock
 
 @pytest.mark.asyncio
 @patch("opensandbox_server.services.docker.docker")
-async def test_create_sandbox_windows_profile_passes_download_url_override(mock_docker):
+async def test_create_sandbox_windows_profile_does_not_require_download_url_override(mock_docker):
     mock_client = MagicMock()
     mock_client.containers.list.return_value = []
     mock_docker.from_env.return_value = mock_client
 
-    service = DockerSandboxService(config=_app_config())
+    cfg = _app_config()
+    cfg.runtime.execd_image = "ghcr.io/opensandbox/execd:latest"
+    service = DockerSandboxService(config=cfg)
     request = CreateSandboxRequest(
         image=ImageSpec(uri="dockurr/windows:latest"),
         resourceLimits=ResourceLimits(root={}),
         entrypoint=["cmd", "/c", "echo ready"],
         platform=PlatformSpec(os="windows", arch="amd64"),
-        env={"EXECD_DOWNLOAD_URL": "https://example.com/override.exe"},
     )
     created_container = MagicMock()
     created_container.image.attrs = {"Os": "windows", "Architecture": "amd64"}
@@ -1266,40 +1267,7 @@ async def test_create_sandbox_windows_profile_passes_download_url_override(mock_
     ):
         await service.create_sandbox(request)
 
-    assert mock_create.call_args.kwargs["windows_execd_download_url"] == "https://example.com/override.exe"
-
-
-@pytest.mark.asyncio
-@patch("opensandbox_server.services.docker.docker")
-async def test_create_sandbox_windows_profile_rejects_non_release_execd_tag_without_override(mock_docker):
-    mock_client = MagicMock()
-    mock_client.containers.list.return_value = []
-    mock_docker.from_env.return_value = mock_client
-
-    cfg = _app_config()
-    cfg.runtime.execd_image = "ghcr.io/opensandbox/execd:latest"
-    service = DockerSandboxService(config=cfg)
-    request = CreateSandboxRequest(
-        image=ImageSpec(uri="dockurr/windows:latest"),
-        resourceLimits=ResourceLimits(root={}),
-        entrypoint=["cmd", "/c", "echo ready"],
-        platform=PlatformSpec(os="windows", arch="amd64"),
-    )
-
-    with (
-        patch(
-            "opensandbox_server.services.docker.validate_windows_runtime_prerequisites",
-            return_value=[],
-        ),
-        patch.object(service, "_create_and_start_container") as mock_create,
-        pytest.raises(HTTPException) as exc_info,
-    ):
-        await service.create_sandbox(request)
-
-    assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
-    assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
-    assert "release-like execd image tag" in exc_info.value.detail["message"]
-    mock_create.assert_not_called()
+    mock_create.assert_called_once()
 
 
 @pytest.mark.asyncio

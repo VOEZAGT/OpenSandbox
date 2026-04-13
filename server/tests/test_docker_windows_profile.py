@@ -20,10 +20,8 @@ from fastapi import HTTPException
 from opensandbox_server.api.schema import PlatformSpec
 from opensandbox_server.services.docker_windows_profile import (
     apply_windows_runtime_host_config_defaults,
-    escape_batch_env_value,
     inject_windows_user_ports,
     resolve_docker_platform,
-    resolve_windows_execd_download_url,
     validate_windows_runtime_prerequisites,
 )
 
@@ -88,64 +86,3 @@ def test_inject_windows_user_ports_merges_existing_value():
     assert "USER_PORTS=3389,44772,8080" in updated
 
 
-def test_resolve_windows_execd_download_url_prefers_request_env_override():
-    url = resolve_windows_execd_download_url(
-        {"EXECD_DOWNLOAD_URL": "https://example.com/custom.exe"},
-        "ghcr.io/opensandbox/execd:v1.2.3",
-        "arm64",
-    )
-    assert url == "https://example.com/custom.exe"
-
-
-def test_resolve_windows_execd_download_url_uses_image_tag_and_arch():
-    url = resolve_windows_execd_download_url(
-        {},
-        "ghcr.io/opensandbox/execd:v1.2.3",
-        "arm64",
-    )
-    assert "docker%2Fexecd%2Fv1.2.3" in url
-    assert url.endswith("execd_v1.2.3_windows_arm64.exe")
-
-
-def test_resolve_windows_execd_download_url_handles_registry_port():
-    url = resolve_windows_execd_download_url(
-        {},
-        "registry.internal:5000/opensandbox/execd:v9.9.9",
-        "amd64",
-    )
-    assert "docker%2Fexecd%2Fv9.9.9" in url
-    assert url.endswith("execd_v9.9.9_windows_amd64.exe")
-
-
-def test_resolve_windows_execd_download_url_falls_back_when_tag_missing():
-    url = resolve_windows_execd_download_url(
-        {},
-        "ghcr.io/opensandbox/execd",
-        "x86_64",
-    )
-    assert "docker%2Fexecd%2Fv1.0.11" in url
-    assert url.endswith("execd_v1.0.11_windows_amd64.exe")
-
-
-def test_resolve_windows_execd_download_url_rejects_non_release_tag():
-    with pytest.raises(HTTPException) as exc_info:
-        resolve_windows_execd_download_url(
-            {},
-            "ghcr.io/opensandbox/execd:latest",
-            "amd64",
-        )
-    assert exc_info.value.status_code == 400
-    assert "release-like execd image tag" in exc_info.value.detail["message"]
-
-
-def test_resolve_windows_execd_download_url_override_allows_non_release_tag():
-    url = resolve_windows_execd_download_url(
-        {"EXECD_DOWNLOAD_URL": "https://example.com/custom.exe"},
-        "ghcr.io/opensandbox/execd:latest",
-        "amd64",
-    )
-    assert url == "https://example.com/custom.exe"
-
-
-def test_escape_batch_env_value_escapes_percent_signs():
-    assert escape_batch_env_value("docker%2Fexecd") == "docker%%2Fexecd"
