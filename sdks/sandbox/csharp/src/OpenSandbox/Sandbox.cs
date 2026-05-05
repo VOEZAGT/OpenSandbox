@@ -128,11 +128,22 @@ public sealed class Sandbox : IAsyncDisposable
         var logger = loggerFactory.CreateLogger("OpenSandbox.Sandbox");
         var lifecycleBaseUrl = connectionConfig.GetBaseUrl();
         var adapterFactory = options.AdapterFactory ?? DefaultAdapterFactory.Create();
+        if (string.IsNullOrWhiteSpace(options.Image) == string.IsNullOrWhiteSpace(options.SnapshotId))
+        {
+            throw new InvalidArgumentException("Exactly one of Image or SnapshotId must be specified.");
+        }
+        if (!string.IsNullOrWhiteSpace(options.SnapshotId) && options.Entrypoint is not null)
+        {
+            throw new InvalidArgumentException("Entrypoint must be omitted when SnapshotId is provided.");
+        }
         ValidateHostPaths(options.Volumes);
         var httpClientProvider = new HttpClientProvider(connectionConfig, loggerFactory);
 
         ISandboxes sandboxes;
-        logger.LogInformation("Creating sandbox (image={Image}, useServerProxy={UseServerProxy})", options.Image, connectionConfig.UseServerProxy);
+        logger.LogInformation(
+            "Creating sandbox (startupSource={StartupSource}, useServerProxy={UseServerProxy})",
+            options.Image ?? options.SnapshotId,
+            connectionConfig.UseServerProxy);
         try
         {
             var lifecycleStack = adapterFactory.CreateLifecycleStack(new CreateLifecycleStackOptions
@@ -153,15 +164,21 @@ public sealed class Sandbox : IAsyncDisposable
 
         var request = new CreateSandboxRequest
         {
-            Image = new ImageSpec
-            {
-                Uri = options.Image,
-                Auth = options.ImageAuth
-            },
-            Entrypoint = options.Entrypoint ?? Constants.DefaultEntrypoint,
+            Image = string.IsNullOrWhiteSpace(options.Image)
+                ? null
+                : new ImageSpec
+                {
+                    Uri = options.Image!,
+                    Auth = options.ImageAuth
+                },
+            SnapshotId = options.SnapshotId,
+            Entrypoint = string.IsNullOrWhiteSpace(options.SnapshotId)
+                ? options.Entrypoint ?? Constants.DefaultEntrypoint
+                : null,
             Timeout = options.ManualCleanup ? null : options.TimeoutSeconds ?? Constants.DefaultTimeoutSeconds,
             ResourceLimits = options.Resource ?? Constants.DefaultResourceLimits,
             Env = options.Env,
+            SecureAccess = options.SecureAccess,
             Metadata = options.Metadata,
             Platform = options.Platform,
             NetworkPolicy = options.NetworkPolicy != null
@@ -524,6 +541,19 @@ public sealed class Sandbox : IAsyncDisposable
     }
 
     /// <summary>
+    /// Creates a persistent snapshot from this sandbox.
+    /// </summary>
+    public Task<SnapshotInfo> CreateSnapshotAsync(
+        string? name = null,
+        CancellationToken cancellationToken = default)
+    {
+        return _sandboxes.CreateSnapshotAsync(
+            Id,
+            new CreateSnapshotRequest { Name = name },
+            cancellationToken);
+    }
+
+    /// <summary>
     /// Gets current egress policy for this sandbox.
     /// </summary>
     /// <param name="cancellationToken">Cancellation token.</param>
@@ -559,6 +589,19 @@ public sealed class Sandbox : IAsyncDisposable
     public Task<Endpoint> GetEndpointAsync(int port, CancellationToken cancellationToken = default)
     {
         return _sandboxes.GetSandboxEndpointAsync(Id, port, ConnectionConfig.UseServerProxy, cancellationToken);
+    }
+
+    /// <summary>
+    /// Gets a signed endpoint for a port with an OSEP-0011 route token.
+    /// </summary>
+    /// <param name="port">The port number.</param>
+    /// <param name="expires">Unix epoch seconds for the signed route token expiry.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The endpoint information.</returns>
+    /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
+    public Task<Endpoint> GetSignedEndpointAsync(int port, long expires, CancellationToken cancellationToken = default)
+    {
+        return _sandboxes.GetSignedSandboxEndpointAsync(Id, port, expires, ConnectionConfig.UseServerProxy, cancellationToken);
     }
 
     /// <summary>

@@ -17,12 +17,19 @@ from pydantic import ValidationError
 
 from opensandbox_server.api.schema import (
     CreateSandboxRequest,
+    CreateSnapshotRequest,
     Host,
     ImageSpec,
+    ListSnapshotsRequest,
     OSSFS,
+    PaginationInfo,
+    PaginationRequest,
     PlatformSpec,
     PVC,
     ResourceLimits,
+    Snapshot,
+    SnapshotFilter,
+    SnapshotStatus,
     Volume,
 )
 
@@ -263,6 +270,88 @@ class TestVolume:
         assert volume.read_only is False
         assert volume.sub_path == "task-001"
 
+
+class TestSnapshots:
+
+    def test_create_snapshot_request_accepts_optional_name(self):
+        request = CreateSnapshotRequest(name="checkpoint-before-import")
+        assert request.name == "checkpoint-before-import"
+
+    def test_snapshot_serialization_uses_aliases(self):
+        snapshot = Snapshot(
+            id="snap-001",
+            sandboxId="sbx-001",
+            name="checkpoint-before-import",
+            status=SnapshotStatus(state="Ready"),
+            createdAt="2026-04-22T00:00:00Z",
+        )
+        data = snapshot.model_dump(by_alias=True, exclude_none=True)
+        assert data["sandboxId"] == "sbx-001"
+        assert data["createdAt"] == snapshot.created_at
+        assert data["status"] == {"state": "Ready"}
+
+    def test_list_snapshots_request_supports_alias_filter(self):
+        request = ListSnapshotsRequest(
+            filter=SnapshotFilter(sandboxId="sbx-001", state=["Ready"]),
+            pagination=PaginationRequest(page=2, pageSize=50),
+        )
+        assert request.filter.sandbox_id == "sbx-001"
+        assert request.pagination is not None
+        assert request.pagination.page_size == 50
+
+    def test_pagination_info_serializes_aliases(self):
+        pagination = PaginationInfo(
+            page=1,
+            pageSize=20,
+            totalItems=3,
+            totalPages=1,
+            hasNextPage=False,
+        )
+        data = pagination.model_dump(by_alias=True)
+        assert data == {
+            "page": 1,
+            "pageSize": 20,
+            "totalItems": 3,
+            "totalPages": 1,
+            "hasNextPage": False,
+        }
+
+
+class TestCreateSandboxRequestSnapshotCompat:
+
+    def test_accepts_snapshot_id_without_entrypoint(self):
+        request = CreateSandboxRequest(
+            snapshotId="snap-001",
+            resourceLimits=ResourceLimits(root={"cpu": "500m"}),
+        )
+        assert request.snapshot_id == "snap-001"
+        assert request.image is None
+        assert request.entrypoint is None
+
+    def test_accepts_snapshot_id_with_entrypoint(self):
+        request = CreateSandboxRequest(
+            snapshotId="snap-001",
+            resourceLimits=ResourceLimits(root={"cpu": "500m"}),
+            entrypoint=["python", "app.py"],
+        )
+        assert request.snapshot_id == "snap-001"
+        assert request.entrypoint == ["python", "app.py"]
+
+    def test_treats_blank_image_uri_as_missing_image(self):
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="   "),
+            snapshotId="snap-001",
+            resourceLimits=ResourceLimits(root={"cpu": "500m"}),
+        )
+        assert request.image is None
+        assert request.snapshot_id == "snap-001"
+
+    def test_rejects_when_both_image_and_snapshot_missing(self):
+        with pytest.raises(ValidationError):
+            CreateSandboxRequest(
+                resourceLimits=ResourceLimits(root={"cpu": "500m"}),
+            )
+
     def test_deserialization_pvc_volume(self):
         data = {
             "name": "models",
@@ -314,6 +403,22 @@ class TestCreateSandboxRequestWithVolumes:
             entrypoint=["python", "-c", "print('hello')"],
         )
         assert request.volumes is None
+        assert request.secure_access is False
+
+    def test_request_with_secure_access(self):
+        request = CreateSandboxRequest.model_validate(
+            {
+                "image": {"uri": "python:3.11"},
+                "timeout": 3600,
+                "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+                "entrypoint": ["python", "-c", "print('hello')"],
+                "secureAccess": True,
+            }
+        )
+        assert request.secure_access is True
+
+        data = request.model_dump(by_alias=True, exclude_none=True)
+        assert data["secureAccess"] is True
 
     def test_request_with_empty_volumes(self):
         request = CreateSandboxRequest(
@@ -494,3 +599,5 @@ class TestCreateSandboxRequestWithVolumes:
         )
 
         assert request.timeout == 172800
+
+

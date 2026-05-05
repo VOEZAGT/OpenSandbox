@@ -27,7 +27,10 @@ from typing import Optional, Dict, Any
 
 from fastapi import HTTPException, status
 
-from opensandbox_server.extensions import apply_access_renew_extend_seconds_to_mapping
+from opensandbox_server.extensions import (
+    apply_access_renew_extend_seconds_to_mapping,
+    apply_extensions_to_annotations,
+)
 from opensandbox_server.extensions.keys import ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY
 from opensandbox_server.api.schema import (
     CreateSandboxRequest,
@@ -40,17 +43,18 @@ from opensandbox_server.api.schema import (
     Sandbox,
     SandboxStatus,
 )
-from opensandbox_server.config import AppConfig, get_config
+from opensandbox_server.config import AppConfig, INGRESS_MODE_GATEWAY, SecureAccessConfig, get_config
 from opensandbox_server.services.constants import (
     SANDBOX_ID_LABEL,
     SandboxErrorCodes,
 )
-from opensandbox_server.services.endpoint_auth import generate_egress_token
+from opensandbox_server.services.endpoint_auth import generate_egress_token, generate_secure_access_token
 from opensandbox_server.services.extension_service import ExtensionService
+from opensandbox_server.services.helpers import format_ingress_endpoint
 from opensandbox_server.services.k8s.create_helpers import _build_create_workload_context
 from opensandbox_server.services.k8s.error_helpers import _build_k8s_api_error
 from opensandbox_server.services.k8s.k8s_diagnostics import K8sDiagnosticsMixin
-from opensandbox_server.services.k8s.endpoint_resolver import _attach_egress_auth_headers
+from opensandbox_server.services.k8s.endpoint_resolver import _attach_egress_auth_headers, _attach_secure_access_headers
 from opensandbox_server.services.k8s.list_helpers import _build_list_sandboxes_response
 from opensandbox_server.services.k8s.status_helpers import (
     _is_unschedulable_status,
@@ -59,6 +63,11 @@ from opensandbox_server.services.k8s.status_helpers import (
 from opensandbox_server.services.k8s.workload_mapper import (
     _build_sandbox_from_workload,
     _extract_platform_from_workload,
+)
+from opensandbox_server.services.signing import (
+    build_canonical_bytes,
+    compute_signature,
+    encode_expires_b36,
 )
 from opensandbox_server.services.k8s.workload_access import (
     _delete_workload_or_404,
@@ -76,6 +85,7 @@ from opensandbox_server.services.validators import (
 )
 from opensandbox_server.services.k8s.client import K8sClient
 from opensandbox_server.services.k8s.provider_factory import create_workload_provider
+from opensandbox_server.services.snapshot_restore import resolve_sandbox_image_from_request
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +115,12 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         
         if not self.app_config.kubernetes:
             raise ValueError("Kubernetes configuration is required")
-        
+
         self.ingress_config = self.app_config.ingress
 
         self.namespace = self.app_config.kubernetes.namespace
         self.execd_image = runtime_config.execd_image
-        
+
         try:
             self.k8s_client = K8sClient(self.app_config.kubernetes)
             logger.info("Kubernetes client initialized successfully")
@@ -123,7 +133,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     "message": f"Failed to initialize Kubernetes client: {str(e)}",
                 },
             ) from e
-        
+
         provider_type = self.app_config.kubernetes.workload_provider
         try:
             self.workload_provider = create_workload_provider(
@@ -143,7 +153,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     "message": f"Invalid workload provider configuration: {str(e)}",
                 },
             ) from e
-        
+
         logger.info(
             "KubernetesSandboxService initialized: namespace=%s, execd_image=%s",
             self.namespace,
@@ -195,14 +205,14 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 )
                 current_state = status_info["state"]
                 current_message = status_info["message"]
-                
+
                 if current_state != last_state or current_message != last_message:
                     logger.info(
                         f"Sandbox {sandbox_id} state: {current_state} - {current_message}"
                     )
                     last_state = current_state
                     last_message = current_message
-                
+
                 if current_state in ("Running", "Allocated"):
                     return workload
                 if _is_unschedulable_status(status_info):
@@ -216,7 +226,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                             ),
                         },
                     )
-                
+
             except HTTPException:
                 raise
             except Exception as e:
@@ -224,9 +234,9 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     f"Error checking sandbox {sandbox_id} status: {e}",
                     exc_info=True
                 )
-            
+
             await asyncio.sleep(poll_interval_seconds)
-        
+
         elapsed = time.time() - start_time
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -268,6 +278,23 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             },
         )
 
+    def _ensure_secure_access_support(self, request: CreateSandboxRequest) -> None:
+        """Validate that secure access can be enforced for the configured exposure mode."""
+        if not request.secure_access:
+            return
+        if self.ingress_config and self.ingress_config.mode == INGRESS_MODE_GATEWAY:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_PARAMETER,
+                "message": (
+                    "secureAccess is currently supported only for Kubernetes sandboxes exposed "
+                    "through ingress.mode='gateway'. Configure ingress gateway mode or disable secureAccess."
+                ),
+            },
+        )
+
     def _ensure_pvc_volumes(self, volumes: list) -> None:
         """
         Ensure that PVC volumes exist before creating the workload.
@@ -299,14 +326,13 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             except ApiException as e:
                 if e.status == 403:
                     logger.warning(
-                        "No RBAC permission to read PVC '%s', skipping auto-create. "
-                        "Grant 'get' and 'create' on 'persistentvolumeclaims' to enable.",
-                        claim_name,
+                        f"No RBAC permission to read PVC '{claim_name}', skipping auto-create. "
+                        "Grant 'get' and 'create' on 'persistentvolumeclaims' to enable."
                     )
                     return  # Skip all remaining PVCs — same SA, same permissions
                 raise
             if existing is not None:
-                logger.debug("PVC '%s' already exists in namespace '%s'", claim_name, self.namespace)
+                logger.debug(f"PVC '{claim_name}' already exists in namespace '{self.namespace}'")
                 continue
 
             storage = vol.pvc.storage or default_size
@@ -329,18 +355,17 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             try:
                 self.k8s_client.create_pvc(self.namespace, pvc_body)
                 logger.info(
-                    "Auto-created PVC '%s' (size=%s, class=%s) in namespace '%s'",
-                    claim_name, storage, storage_class or "<default>", self.namespace,
+                    f"Auto-created PVC '{claim_name}' (size={storage}, class={storage_class or '<default>'}) "
+                    f"in namespace '{self.namespace}'"
                 )
             except ApiException as e:
                 if e.status == 409:
                     # Race condition: another request created it between our check and create
-                    logger.info("PVC '%s' was created concurrently, proceeding", claim_name)
+                    logger.info(f"PVC '{claim_name}' was created concurrently, proceeding")
                 elif e.status == 403:
                     logger.warning(
-                        "No RBAC permission to create PVC '%s', skipping. "
-                        "The PVC must be pre-created or RBAC must be updated.",
-                        claim_name,
+                        f"No RBAC permission to create PVC '{claim_name}', skipping. "
+                        "The PVC must be pre-created or RBAC must be updated."
                     )
                 elif e.status in (400, 422):
                     # Invalid PVC spec from user-provided hints
@@ -354,7 +379,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         },
                     ) from e
                 else:
-                    logger.error("Failed to create PVC '%s': %s", claim_name, e)
+                    logger.error(f"Failed to create PVC '{claim_name}': {e}")
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail={
@@ -378,18 +403,20 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         Raises:
             HTTPException: If creation fails, timeout, or invalid parameters
         """
-        ensure_entrypoint(request.entrypoint)
+        request = resolve_sandbox_image_from_request(request)
+        ensure_entrypoint(request.entrypoint or [])
         ensure_metadata_labels(request.metadata)
         ensure_platform_valid(request.platform)
         ensure_timeout_within_limit(
             request.timeout,
             self.app_config.server.max_sandbox_timeout_seconds,
         )
+        self._ensure_secure_access_support(request)
         self._ensure_network_policy_support(request)
         self._ensure_image_auth_support(request)
-        
+
         sandbox_id = self.generate_sandbox_id()
-        
+
         created_at = datetime.now(timezone.utc)
         context = _build_create_workload_context(
             app_config=self.app_config,
@@ -397,14 +424,16 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             sandbox_id=sandbox_id,
             created_at=created_at,
             egress_token_factory=generate_egress_token,
+            secure_access_token_factory=generate_secure_access_token,
         )
         
         try:
             apply_access_renew_extend_seconds_to_mapping(context.annotations, request.extensions)
+            apply_extensions_to_annotations(context.annotations, request.extensions)
 
             ensure_volumes_valid(
                 request.volumes,
-                self.app_config.storage.allowed_host_paths or None,
+                self.app_config.storage.allowed_host_paths,
             )
             
 
@@ -438,7 +467,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 sandbox_id,
                 workload_info.get("name"),
             )
-            
+
             try:
                 workload = await self._wait_for_sandbox_ready(
                     sandbox_id=sandbox_id,
@@ -450,7 +479,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     self.workload_provider.get_status(workload)
                 )
                 effective_platform = _extract_platform_from_workload(workload)
-                
+
                 return CreateSandboxResponse(
                     id=sandbox_id,
                     status=SandboxStatus(
@@ -498,13 +527,13 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
         """
         Get sandbox by ID.
-        
+
         Args:
             sandbox_id: Unique sandbox identifier
-            
+
         Returns:
             Sandbox: Sandbox information
-            
+
         Raises:
             HTTPException: If sandbox not found
         """
@@ -558,10 +587,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
     def delete_sandbox(self, sandbox_id: str) -> None:
         """
         Delete a sandbox.
-        
+
         Args:
             sandbox_id: Unique sandbox identifier
-            
+
         Raises:
             HTTPException: If deletion fails
         """
@@ -581,39 +610,85 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
     
     def pause_sandbox(self, sandbox_id: str) -> None:
         """
-        Pause sandbox (not supported in Kubernetes).
-        
-        Args:
-            sandbox_id: Unique sandbox identifier
-            
-        Raises:
-            HTTPException: Always raises 501 Not Implemented
+        Pause sandbox by delegating to the workload provider.
         """
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={
-                "code": SandboxErrorCodes.API_NOT_SUPPORTED,
-                "message": "Pause operation is not supported in Kubernetes runtime",
-            },
-        )
-    
+        try:
+            self.workload_provider.pause_sandbox(sandbox_id, self.namespace)
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_STATE,
+                    "message": "Pause is not supported for this sandbox type",
+                },
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "not found" in msg:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
+                        "message": msg,
+                    },
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_STATE,
+                    "message": msg,
+                },
+            )
+        except Exception as e:
+            logger.error("Failed to pause sandbox %s: %s", sandbox_id, e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": f"Failed to pause sandbox: {e}",
+                },
+            )
+
     def resume_sandbox(self, sandbox_id: str) -> None:
         """
-        Resume sandbox (not supported in Kubernetes).
-        
-        Args:
-            sandbox_id: Unique sandbox identifier
-            
-        Raises:
-            HTTPException: Always raises 501 Not Implemented
+        Resume sandbox by delegating to the workload provider.
         """
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={
-                "code": SandboxErrorCodes.API_NOT_SUPPORTED,
-                "message": "Resume operation is not supported in Kubernetes runtime",
-            },
-        )
+        try:
+            self.workload_provider.resume_sandbox(sandbox_id, self.namespace)
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_STATE,
+                    "message": "Resume is not supported for this sandbox type",
+                },
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "not found" in msg:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
+                        "message": msg,
+                    },
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_STATE,
+                    "message": msg,
+                },
+            )
+        except Exception as e:
+            logger.error("Failed to resume sandbox %s: %s", sandbox_id, e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": f"Failed to resume sandbox: {e}",
+                },
+            )
 
     def get_access_renew_extend_seconds(self, sandbox_id: str) -> Optional[int]:
         workload = self.workload_provider.get_workload(
@@ -700,31 +775,65 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         sandbox_id: str,
         port: int,
         resolve_internal: bool = False,
+        expires: Optional[int] = None,
     ) -> Endpoint:
         """
         Get sandbox access endpoint.
-        
+
         Args:
             sandbox_id: Unique sandbox identifier
             port: Port number
             resolve_internal: Ignored for Kubernetes (always returns Pod IP)
-            
+            expires: Unix epoch seconds for a signed route token.
+                Requires ingress gateway mode with secure_access keys configured.
+
         Returns:
             Endpoint: Endpoint information
-            
+
         Raises:
-            HTTPException: If endpoint not available
+            HTTPException: If endpoint not available or signed routes unsupported
         """
         self.validate_port(port)
-        
+
+        if expires is not None:
+            if expires < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": "expires must be a non-negative Unix timestamp (uint64).",
+                    },
+                )
+            now = int(time.time())
+            if expires <= now:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": f"expires ({expires}) must be greater than current time ({now}).",
+                    },
+                )
+            if expires > 18446744073709551615:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": "expires exceeds uint64 maximum value.",
+                    },
+                )
+
         try:
             workload = _get_workload_or_404(
                 self.workload_provider,
                 self.namespace,
                 sandbox_id,
             )
-            
-            endpoint = self.workload_provider.get_endpoint_info(workload, port, sandbox_id)
+
+            if expires is not None:
+                endpoint = self._build_signed_endpoint(sandbox_id, port, expires)
+            else:
+                endpoint = self.workload_provider.get_endpoint_info(workload, port, sandbox_id)
+
             if not endpoint:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -733,12 +842,67 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                         "message": "Pod IP is not yet available. The Pod may still be starting.",
                     },
                 )
+            if expires is None:
+                _attach_secure_access_headers(endpoint, workload)
             _attach_egress_auth_headers(endpoint, workload)
             return endpoint
-            
+
         except HTTPException:
             raise
         except Exception as e:
             logger.error(f"Error getting endpoint for {sandbox_id}:{port}: {e}")
             raise _build_k8s_api_error("get endpoint", e) from e
 
+    def _build_signed_endpoint(self, sandbox_id: str, port: int, expires: int) -> Endpoint:
+        """Build a signed ingress endpoint per OSEP-0011."""
+        secure_cfg = self._get_secure_access_config()
+
+        expires_b36 = encode_expires_b36(expires)
+        secret = secure_cfg.get_active_secret_bytes()
+        active_key = secure_cfg.active_key
+        canonical = build_canonical_bytes(sandbox_id, port, expires_b36)
+        signature = compute_signature(secret, active_key, canonical)
+
+        endpoint = format_ingress_endpoint(
+            self.ingress_config, sandbox_id, port,
+            expires_b36=expires_b36, signature=signature,
+        )
+        if endpoint is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        "Signed routes are only available when ingress is in gateway mode. "
+                        "Configure ingress gateway or omit the expires parameter."
+                    ),
+                },
+            )
+        return endpoint
+
+    def _get_secure_access_config(self) -> SecureAccessConfig:
+        """Return the secure_access config or raise 400 if not configured."""
+        if not self.ingress_config or self.ingress_config.mode != INGRESS_MODE_GATEWAY:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        "Signed routes require ingress.mode = 'gateway'. "
+                        "Configure ingress gateway or omit the expires parameter."
+                    ),
+                },
+            )
+        secure = self.ingress_config.secure_access
+        if secure is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": (
+                        "Signed routes require ingress.secure_access to be configured "
+                        "with signing keys. Configure secure_access or omit the expires parameter."
+                    ),
+                },
+            )
+        return secure

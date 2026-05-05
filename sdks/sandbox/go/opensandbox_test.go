@@ -81,15 +81,15 @@ func TestCreateSandbox(t *testing.T) {
 
 		var req CreateSandboxRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		if req.Image.URI != "python:3.12" {
-			assert.Fail(t, fmt.Sprintf("expected image python:3.12, got %s", req.Image.URI))
+		if req.Image == nil || req.Image.URI != "python:3.12" {
+			assert.Fail(t, fmt.Sprintf("expected image python:3.12, got %+v", req.Image))
 		}
 
 		jsonResponse(w, http.StatusCreated, want)
 	})
 
 	got, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:      ImageSpec{URI: "python:3.12"},
+		Image:      &ImageSpec{URI: "python:3.12"},
 		Entrypoint: []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{
 			"cpu":    "500m",
@@ -110,7 +110,7 @@ func TestCreateSandbox_ImageAuth(t *testing.T) {
 		var req CreateSandboxRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		if req.Image.Auth == nil {
+		if req.Image == nil || req.Image.Auth == nil {
 			require.FailNow(t, "expected ImageAuth to be set")
 		}
 		if req.Image.Auth.Username != "user" {
@@ -128,7 +128,7 @@ func TestCreateSandbox_ImageAuth(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image: ImageSpec{
+		Image: &ImageSpec{
 			URI:  "registry.example.com/private:latest",
 			Auth: &ImageAuth{Username: "user", Password: "pass"},
 		},
@@ -136,6 +136,31 @@ func TestCreateSandbox_ImageAuth(t *testing.T) {
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 	})
 	require.NoErrorf(t, err, "CreateSandbox with ImageAuth")
+}
+
+func TestCreateSandbox_SecureAccess(t *testing.T) {
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req CreateSandboxRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		if !req.SecureAccess {
+			assert.Fail(t, "expected SecureAccess to be true")
+		}
+
+		jsonResponse(w, http.StatusCreated, SandboxInfo{
+			ID:        "sbx-secure",
+			Status:    SandboxStatus{State: StatePending},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		})
+	})
+
+	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
+		Image:          &ImageSpec{URI: "python:3.12"},
+		Entrypoint:     []string{"/bin/sh"},
+		ResourceLimits: ResourceLimits{"cpu": "500m"},
+		SecureAccess:   true,
+	})
+	require.NoErrorf(t, err, "CreateSandbox with SecureAccess")
 }
 
 func TestCreateSandbox_ManualCleanup(t *testing.T) {
@@ -156,12 +181,43 @@ func TestCreateSandbox_ManualCleanup(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		// Timeout is nil — simulates ManualCleanup (no timeout sent)
 	})
 	require.NoErrorf(t, err, "CreateSandbox with ManualCleanup")
+}
+
+func TestCreateSandbox_FromSnapshot(t *testing.T) {
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req CreateSandboxRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		if req.SnapshotID != "snap-123" {
+			assert.Fail(t, fmt.Sprintf("SnapshotID = %q, want %q", req.SnapshotID, "snap-123"))
+		}
+		if req.Image != nil {
+			assert.Fail(t, "expected image to be omitted for snapshot restore")
+		}
+		if len(req.Entrypoint) != 0 {
+			assert.Fail(t, "expected entrypoint to be omitted for snapshot restore")
+		}
+
+		jsonResponse(w, http.StatusCreated, SandboxInfo{
+			ID:         "sbx-snapshot",
+			SnapshotID: "snap-123",
+			Status:     SandboxStatus{State: StatePending},
+			CreatedAt:  time.Now().UTC().Truncate(time.Second),
+			Entrypoint: []string{"/bin/sh"},
+		})
+	})
+
+	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
+		SnapshotID:     "snap-123",
+		ResourceLimits: ResourceLimits{"cpu": "500m"},
+	})
+	require.NoErrorf(t, err, "CreateSandbox from snapshot")
 }
 
 func TestGetSandbox(t *testing.T) {
@@ -248,6 +304,72 @@ func TestDeleteSandbox(t *testing.T) {
 
 	err := client.DeleteSandbox(context.Background(), "sbx-789")
 	require.NoErrorf(t, err, "DeleteSandbox")
+}
+
+func TestSnapshotLifecycle(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	_, client := newLifecycleServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/sandboxes/sbx-1/snapshots":
+			var req CreateSnapshotRequest
+			json.NewDecoder(r.Body).Decode(&req)
+			if req.Name != "before-upgrade" {
+				assert.Fail(t, fmt.Sprintf("Name = %q, want %q", req.Name, "before-upgrade"))
+			}
+			jsonResponse(w, http.StatusAccepted, SnapshotInfo{
+				ID:        "snap-1",
+				SandboxID: "sbx-1",
+				Name:      "before-upgrade",
+				Status:    SnapshotStatus{State: SnapshotStateCreating},
+				CreatedAt: now,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/snapshots/snap-1":
+			jsonResponse(w, http.StatusOK, SnapshotInfo{
+				ID:        "snap-1",
+				SandboxID: "sbx-1",
+				Status:    SnapshotStatus{State: SnapshotStateReady},
+				CreatedAt: now,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/snapshots":
+			if r.URL.Query().Get("sandboxId") != "sbx-1" {
+				assert.Fail(t, fmt.Sprintf("sandboxId = %q, want %q", r.URL.Query().Get("sandboxId"), "sbx-1"))
+			}
+			jsonResponse(w, http.StatusOK, ListSnapshotsResponse{
+				Items: []SnapshotInfo{{
+					ID:        "snap-1",
+					SandboxID: "sbx-1",
+					Status:    SnapshotStatus{State: SnapshotStateReady},
+					CreatedAt: now,
+				}},
+				Pagination: PaginationInfo{Page: 1, PageSize: 10, TotalItems: 1, TotalPages: 1},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/snapshots/snap-1":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			assert.Fail(t, fmt.Sprintf("unexpected request: %s %s", r.Method, r.URL.Path))
+		}
+	})
+
+	created, err := client.CreateSnapshot(context.Background(), "sbx-1", CreateSnapshotRequest{Name: "before-upgrade"})
+	require.NoErrorf(t, err, "CreateSnapshot")
+	require.Equal(t, "snap-1", created.ID)
+
+	got, err := client.GetSnapshot(context.Background(), "snap-1")
+	require.NoErrorf(t, err, "GetSnapshot")
+	require.Equal(t, SnapshotStateReady, got.Status.State)
+
+	listed, err := client.ListSnapshots(context.Background(), ListSnapshotsOptions{
+		SandboxID: "sbx-1",
+		States:    []SnapshotState{SnapshotStateReady},
+		Page:      1,
+		PageSize:  10,
+	})
+	require.NoErrorf(t, err, "ListSnapshots")
+	require.Len(t, listed.Items, 1)
+
+	err = client.DeleteSnapshot(context.Background(), "snap-1")
+	require.NoErrorf(t, err, "DeleteSnapshot")
 }
 
 func TestResumeSandbox(t *testing.T) {
@@ -1423,6 +1545,32 @@ func TestExecuteCode_SSE(t *testing.T) {
 	}
 }
 
+func TestExecuteCode_SSE_EmptyStream(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			assert.Fail(t, fmt.Sprintf("expected POST, got %s", r.Method))
+		}
+		if r.URL.Path != "/code" {
+			assert.Fail(t, fmt.Sprintf("expected /code, got %s", r.URL.Path))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	})
+
+	err := client.ExecuteCode(context.Background(), RunCodeRequest{
+		Context: &CodeContext{Language: "python"},
+		Code:    "2+2",
+	}, func(event StreamEvent) error {
+		return nil
+	})
+	if err == nil {
+		require.FailNow(t, "ExecuteCode should fail on empty SSE stream")
+	}
+	if !strings.Contains(err.Error(), "empty sse stream") {
+		assert.Fail(t, fmt.Sprintf("err = %v, want empty sse stream", err))
+	}
+}
+
 func TestExecuteCode_InContext(t *testing.T) {
 	ssePayload := `{"type":"stdout","text":"hello from context","timestamp":1000}` + "\n\n" +
 		`{"type":"execution_complete","timestamp":1001,"execution_time":10}` + "\n\n"
@@ -2053,7 +2201,7 @@ func TestCreateSandbox_WithNetworkPolicy(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		NetworkPolicy: &NetworkPolicy{
@@ -2108,7 +2256,7 @@ func TestCreateSandbox_WithVolumes(t *testing.T) {
 	})
 
 	_, err := client.CreateSandbox(context.Background(), CreateSandboxRequest{
-		Image:          ImageSpec{URI: "python:3.12"},
+		Image:          &ImageSpec{URI: "python:3.12"},
 		Entrypoint:     []string{"/bin/sh"},
 		ResourceLimits: ResourceLimits{"cpu": "500m"},
 		Volumes: []Volume{

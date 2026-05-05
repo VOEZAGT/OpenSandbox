@@ -42,12 +42,17 @@ public class SandboxCreateOptions
     /// Gets or sets the container image URI (e.g., "python:3.11").
     /// Can also be an ImageSpec object with authentication.
     /// </summary>
-    public required string Image { get; set; }
+    public string? Image { get; set; }
 
     /// <summary>
     /// Gets or sets the image authentication credentials.
     /// </summary>
     public ImageAuth? ImageAuth { get; set; }
+
+    /// <summary>
+    /// Gets or sets the snapshot identifier to restore from.
+    /// </summary>
+    public string? SnapshotId { get; set; }
 
     /// <summary>
     /// Gets or sets the entrypoint command for the sandbox.
@@ -84,6 +89,11 @@ public class SandboxCreateOptions
     /// Gets or sets the extension parameters.
     /// </summary>
     public IReadOnlyDictionary<string, string>? Extensions { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether to enable secured access for sandbox endpoints.
+    /// </summary>
+    public bool SecureAccess { get; set; }
 
     /// <summary>
     /// Gets or sets the resource limits.

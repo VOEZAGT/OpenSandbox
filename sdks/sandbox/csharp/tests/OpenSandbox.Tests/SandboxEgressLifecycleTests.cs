@@ -101,6 +101,34 @@ public class SandboxEgressLifecycleTests
     }
 
     [Fact]
+    public async Task CreateAsync_ShouldSupportSnapshotRestore()
+    {
+        var sandboxes = new StubSandboxes();
+        var adapterFactory = new StubAdapterFactory(sandboxes, new StubEgress());
+
+        await using var sandbox = await Sandbox.CreateAsync(new SandboxCreateOptions
+        {
+            SnapshotId = "snap-123",
+            ConnectionConfig = new ConnectionConfig(new ConnectionConfigOptions
+            {
+                Domain = "127.0.0.1:8080",
+                Protocol = ConnectionProtocol.Http
+            }),
+            AdapterFactory = adapterFactory,
+            SkipHealthCheck = true,
+            Diagnostics = new SdkDiagnosticsOptions
+            {
+                LoggerFactory = NullLoggerFactory.Instance
+            }
+        });
+
+        sandboxes.LastCreateRequest.Should().NotBeNull();
+        sandboxes.LastCreateRequest!.SnapshotId.Should().Be("snap-123");
+        sandboxes.LastCreateRequest.Image.Should().BeNull();
+        sandboxes.LastCreateRequest.Entrypoint.Should().BeNull();
+    }
+
+    [Fact]
     public async Task CreateAsync_ShouldRejectRelativeHostPath()
     {
         var sandboxes = new StubSandboxes();
@@ -224,7 +252,32 @@ public class SandboxEgressLifecycleTests
         public Task<RenewSandboxExpirationResponse> RenewSandboxExpirationAsync(string sandboxId, RenewSandboxExpirationRequest request, CancellationToken cancellationToken = default) =>
             throw new NotImplementedException();
 
+        public Task<SnapshotInfo> CreateSnapshotAsync(string sandboxId, CreateSnapshotRequest? request = null, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task<SnapshotInfo> GetSnapshotAsync(string snapshotId, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task<ListSnapshotsResponse> ListSnapshotsAsync(ListSnapshotsParams? @params = null, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
+        public Task DeleteSnapshotAsync(string snapshotId, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
+
         public Task<Endpoint> GetSandboxEndpointAsync(string sandboxId, int port, bool useServerProxy = false, CancellationToken cancellationToken = default)
+        {
+            EndpointCalls.Add(port);
+            return Task.FromResult(new Endpoint
+            {
+                EndpointAddress = $"127.0.0.1:{port}",
+                Headers = new Dictionary<string, string>
+                {
+                    ["X-Port"] = port.ToString()
+                }
+            });
+        }
+
+        public Task<Endpoint> GetSignedSandboxEndpointAsync(string sandboxId, int port, long expires, bool useServerProxy = false, CancellationToken cancellationToken = default)
         {
             EndpointCalls.Add(port);
             return Task.FromResult(new Endpoint

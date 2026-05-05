@@ -24,5 +24,9 @@ level = "DEBUG"
 type = "docker"
 execd_image = "ghcr.io/opensandbox/platform:latest"
 
+[store]
+type = "sqlite"
+path = "/tmp/opensandbox-server-test.db"
+
 [ingress]
 mode = "direct"

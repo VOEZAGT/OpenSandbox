@@ -1,4 +1,5 @@
 #!/bin/bash
+# trigger k8s e2e
 # Copyright 2026 Alibaba Group Holding Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,7 +58,7 @@ k8s_e2e_wait_http_ok "http://127.0.0.1:${LIFECYCLE_LOCAL_PORT}/health"
 
 export OPENSANDBOX_TEST_DOMAIN="localhost:${LIFECYCLE_LOCAL_PORT}"
 export OPENSANDBOX_TEST_PROTOCOL="http"
-export OPENSANDBOX_TEST_API_KEY=""
+export OPENSANDBOX_TEST_API_KEY="kubernetes-e2e"
 export OPENSANDBOX_SANDBOX_DEFAULT_IMAGE="${SANDBOX_TEST_IMAGE}"
 export OPENSANDBOX_E2E_RUNTIME="kubernetes"
 export OPENSANDBOX_TEST_USE_SERVER_PROXY="true"

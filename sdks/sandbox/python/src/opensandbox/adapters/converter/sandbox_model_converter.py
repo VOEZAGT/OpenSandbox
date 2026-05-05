@@ -29,9 +29,14 @@ from opensandbox.api.lifecycle.models import (
     CreateSandboxResponse,
     Endpoint,
     ListSandboxesResponse,
+    ListSnapshotsResponse,
     RenewSandboxExpirationRequest,
     RenewSandboxExpirationResponse,
     Sandbox,
+    Snapshot,
+)
+from opensandbox.api.lifecycle.models import (
+    CreateSnapshotRequest as ApiCreateSnapshotRequest,
 )
 from opensandbox.api.lifecycle.models import (
     PaginationInfo as ApiPaginationInfo,
@@ -42,9 +47,11 @@ from opensandbox.api.lifecycle.models import (
 from opensandbox.api.lifecycle.models.create_sandbox_request import CreateSandboxRequest
 from opensandbox.api.lifecycle.models.image_spec import ImageSpec
 from opensandbox.models.sandboxes import (
+    CreateSnapshotRequest,
     NetworkPolicy,
     NetworkRule,
     PagedSandboxInfos,
+    PagedSnapshotInfos,
     PaginationInfo,
     PlatformSpec,
     SandboxCreateResponse,
@@ -53,6 +60,8 @@ from opensandbox.models.sandboxes import (
     SandboxInfo,
     SandboxRenewResponse,
     SandboxStatus,
+    SnapshotInfo,
+    SnapshotStatus,
     Volume,
 )
 
@@ -109,7 +118,14 @@ class SandboxModelConverter:
 
         api_pvc = UNSET
         if volume.pvc is not None:
-            api_pvc = ApiPVC(claim_name=volume.pvc.claim_name)
+            api_pvc = ApiPVC(
+                claim_name=volume.pvc.claim_name,
+                create_if_not_exists=volume.pvc.create_if_not_exists,
+                delete_on_sandbox_termination=volume.pvc.delete_on_sandbox_termination,
+                storage_class=volume.pvc.storage_class,
+                storage=volume.pvc.storage,
+                access_modes=volume.pvc.access_modes,
+            )
 
         api_ossfs = UNSET
         if volume.ossfs is not None and volume.ossfs.access_key_id is not None and volume.ossfs.access_key_secret is not None:
@@ -138,8 +154,8 @@ class SandboxModelConverter:
 
     @staticmethod
     def to_api_create_sandbox_request(
-        spec: SandboxImageSpec,
-        entrypoint: list[str],
+        spec: SandboxImageSpec | None,
+        entrypoint: list[str] | None,
         env: dict[str, str],
         metadata: dict[str, str],
         timeout: timedelta | None,
@@ -148,6 +164,8 @@ class SandboxModelConverter:
         network_policy: NetworkPolicy | None,
         extensions: dict[str, str],
         volumes: list[Volume] | None,
+        secure_access: bool = False,
+        snapshot_id: str | None = None,
     ) -> CreateSandboxRequest:
         """Convert domain parameters to API CreateSandboxRequest."""
         from opensandbox.api.lifecycle.models.create_sandbox_request import (
@@ -243,9 +261,15 @@ class SandboxModelConverter:
                 SandboxModelConverter.to_api_volume(v) for v in volumes
             ]
 
+        image = (
+            SandboxModelConverter.to_api_image_spec(spec)
+            if spec is not None
+            else UNSET
+        )
         request = CreateSandboxRequest(
-            image=SandboxModelConverter.to_api_image_spec(spec),
-            entrypoint=entrypoint,
+            image=image,
+            snapshot_id=snapshot_id if snapshot_id is not None else UNSET,
+            entrypoint=entrypoint if entrypoint is not None else UNSET,
             env=api_env,
             metadata=api_metadata,
             resource_limits=api_resource_limits,
@@ -253,10 +277,26 @@ class SandboxModelConverter:
             network_policy=api_network_policy,
             extensions=api_extensions,
             volumes=api_volumes,
+            secure_access=secure_access,
         )
-        if timeout is not None:
+        if timeout is None:
+            # Preserve an explicit manual-cleanup request as JSON null.
+            request.timeout = None
+        else:
             request.timeout = int(timeout.total_seconds())
         return request
+
+    @staticmethod
+    def to_api_create_snapshot_request(
+        request: CreateSnapshotRequest | None,
+    ) -> ApiCreateSnapshotRequest:
+        from opensandbox.api.lifecycle.types import UNSET
+
+        if request is None:
+            return ApiCreateSnapshotRequest()
+        return ApiCreateSnapshotRequest(
+            name=request.name if request.name is not None else UNSET
+        )
 
     @staticmethod
     def to_api_renew_request(
@@ -427,11 +467,49 @@ class SandboxModelConverter:
             id=api_sandbox.id,
             status=SandboxModelConverter._convert_sandbox_status(api_sandbox.status),
             image=domain_image_spec,
+            snapshot_id=(
+                None
+                if isinstance(getattr(api_sandbox, "snapshot_id", None), Unset)
+                else getattr(api_sandbox, "snapshot_id", None)
+            ),
             platform=platform,
             created_at=api_sandbox.created_at,
             expires_at=expires_at,
             entrypoint=api_sandbox.entrypoint,
             metadata=metadata,
+        )
+
+    @staticmethod
+    def to_snapshot_info(api_snapshot: Snapshot) -> SnapshotInfo:
+        from opensandbox.api.lifecycle.types import Unset
+
+        last_transition_at = api_snapshot.status.last_transition_at
+        if isinstance(last_transition_at, Unset):
+            last_transition_at = None
+
+        reason = api_snapshot.status.reason
+        if isinstance(reason, Unset):
+            reason = None
+
+        message = api_snapshot.status.message
+        if isinstance(message, Unset):
+            message = None
+
+        name = api_snapshot.name
+        if isinstance(name, Unset):
+            name = None
+
+        return SnapshotInfo(
+            id=api_snapshot.id,
+            sandbox_id=api_snapshot.sandbox_id,
+            name=name,
+            status=SnapshotStatus(
+                state=api_snapshot.status.state,
+                reason=reason,
+                message=message,
+                last_transition_at=last_transition_at,
+            ),
+            created_at=api_snapshot.created_at,
         )
 
     @staticmethod
@@ -445,6 +523,19 @@ class SandboxModelConverter:
 
         return PagedSandboxInfos(
             sandbox_infos=[SandboxModelConverter.to_sandbox_info(s) for s in items],
+            pagination=SandboxModelConverter._convert_pagination_info(
+                api_response.pagination
+            ),
+        )
+
+    @staticmethod
+    def to_paged_snapshot_infos(
+        api_response: ListSnapshotsResponse,
+    ) -> PagedSnapshotInfos:
+        items = api_response.items if hasattr(api_response, "items") else []
+
+        return PagedSnapshotInfos(
+            snapshot_infos=[SandboxModelConverter.to_snapshot_info(s) for s in items],
             pagination=SandboxModelConverter._convert_pagination_info(
                 api_response.pagination
             ),

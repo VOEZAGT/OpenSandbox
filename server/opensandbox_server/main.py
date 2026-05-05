@@ -20,6 +20,7 @@ and configuration for the sandbox lifecycle management service.
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -32,6 +33,7 @@ from fastapi.responses import JSONResponse
 from opensandbox_server.config import load_config
 from opensandbox_server.integrations.renew_intent import start_renew_intent_consumer
 from opensandbox_server.logging_config import configure_logging
+from opensandbox_server.startup_guard import api_key_confirm
 
 # Load configuration before initializing routers/middleware
 app_config = load_config()
@@ -39,7 +41,7 @@ _log_config = configure_logging(app_config.log)
 
 from opensandbox_server.api.devops import router as devops_router  # noqa: E402
 from opensandbox_server.api.pool import router as pool_router  # noqa: E402
-from opensandbox_server.api.lifecycle import router, sandbox_service  # noqa: E402
+from opensandbox_server.api.lifecycle import router, sandbox_service, snapshot_service  # noqa: E402
 from opensandbox_server.api.proxy import router as proxy_router  # noqa: E402
 from opensandbox_server.integrations.renew_intent.proxy_renew import ProxyRenewCoordinator  # noqa: E402
 from opensandbox_server.middleware.auth import AuthMiddleware  # noqa: E402
@@ -53,6 +55,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        api_key_confirm(configured_api_key=app_config.server.api_key)
+    except Exception as exc:
+        logger.error("API key startup confirmation failed: %s", exc)
+        os._exit(1)
+
     app.state.http_client = httpx.AsyncClient(timeout=180.0)
 
     # Validate secure runtime configuration at startup
@@ -101,6 +109,7 @@ async def lifespan(app: FastAPI):
     consumer = getattr(app.state, "renew_intent_consumer", None)
     if consumer is not None:
         await consumer.stop()
+    snapshot_service.close()
     await app.state.http_client.aclose()
 
 

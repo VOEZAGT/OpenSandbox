@@ -61,7 +61,7 @@ This guide provides comprehensive information for developers working on OpenSand
 
    [runtime]
    type = "docker"
-   execd_image = "opensandbox/execd:v1.0.12"
+   execd_image = "opensandbox/execd:v1.0.14"
 
    [docker]
    network_mode = "host"
@@ -206,7 +206,7 @@ uv run pytest
 uv run pytest tests/test_docker_service.py
 
 # With coverage
-uv run pytest --cov=opensandbox_server --cov-report=html
+uv run pytest --cov=opensandbox_server --cov-report=term --cov-fail-under=80
 ```
 
 ### Writing Tests

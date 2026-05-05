@@ -26,7 +26,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -57,6 +56,8 @@ var (
 	DurationStore                 = requeueduration.DurationStore{}
 )
 
+const batchSandboxFirstPodIndex = 0
+
 type taskScheduleResult struct {
 	Running, Failed, Succeed, Unknown, Pending int32
 }
@@ -67,6 +68,8 @@ type BatchSandboxReconciler struct {
 	Scheme         *runtime.Scheme
 	Recorder       record.EventRecorder
 	taskSchedulers sync.Map
+	// ResumePullSecret is the K8s Secret name for pulling snapshot images during resume.
+	ResumePullSecret string
 }
 
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
@@ -121,9 +124,6 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// task schedule
 	taskStrategy := strategy.NewTaskSchedulingStrategy(batchSbx)
 
-	// pool strategy
-	poolStrategy := strategy.NewPoolStrategy(batchSbx)
-
 	// handle finalizers
 	if batchSbx.DeletionTimestamp == nil {
 		if taskStrategy.NeedTaskScheduling() {
@@ -143,6 +143,17 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
+	// Pause/Resume dispatch: handles pause/resume intent before normal scaling.
+	if result, handled, err := r.dispatchPauseResume(ctx, batchSbx); handled {
+		return result, err
+	}
+
+	// dispatchPauseResume may patch BatchSandbox spec/state (for example resume detaches a pooled
+	// sandbox from its pool). Recompute strategies from the latest object before listing pods so
+	// normal reconciliation does not keep using a stale pre-dispatch view.
+	taskStrategy = strategy.NewTaskSchedulingStrategy(batchSbx)
+	poolStrategy := strategy.NewPoolStrategy(batchSbx)
+
 	pods, err := r.listPods(ctx, poolStrategy, batchSbx)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to list pods %w", err)
@@ -155,81 +166,36 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		utils.WithPodIndexSorter(podIndex),
 		utils.PodNameSorter,
 	}).Sort)
-	// Normal Mode need scale Pods
-	if !poolStrategy.IsPooledMode() {
+	// Normal mode owns pod lifecycle except while a sandbox is fully paused. In Paused, the
+	// snapshot-backed runtime is quiesced and pods must stay absent until resume rewrites the
+	// template images and transitions back through Resuming.
+	if !poolStrategy.IsPooledMode() && batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhasePaused {
 		err := r.scaleBatchSandbox(ctx, batchSbx, batchSbx.Spec.Template, pods)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to scale batch sandbox %w", err)
 		}
 	}
 
-	// TODO merge task status update
-	newStatus := batchSbx.Status.DeepCopy()
-	newStatus.ObservedGeneration = batchSbx.Generation
-	newStatus.Replicas = 0
-	newStatus.Allocated = 0
-	newStatus.Ready = 0
-	ipList := make([]string, len(pods))
-	for i, pod := range pods {
-		newStatus.Replicas++
-		if utils.IsAssigned(pod) {
-			newStatus.Allocated++
-			ipList[i] = pod.Status.PodIP
-		}
-		if pod.Status.Phase == corev1.PodRunning && utils.IsPodReady(pod) {
-			newStatus.Ready++
-		}
-	}
-	raw, _ := json.Marshal(ipList)
-	if batchSbx.Annotations[AnnotationSandboxEndpoints] != string(raw) {
-		patchData, _ := json.Marshal(map[string]any{
-			"metadata": map[string]any{
-				"annotations": map[string]string{
-					AnnotationSandboxEndpoints: string(raw),
-				},
-			},
-		})
-		obj := &sandboxv1alpha1.BatchSandbox{ObjectMeta: metav1.ObjectMeta{Namespace: batchSbx.Namespace, Name: batchSbx.Name}}
-		if err := r.Patch(ctx, obj, client.RawPatch(types.MergePatchType, patchData)); err != nil {
-			log.Error(err, "failed to patch annotation", "annotation", AnnotationSandboxEndpoints, "body", string(patchData))
-			aggErrors = append(aggErrors, err)
-		}
+	runtimeView := buildRuntimeView(batchSbx, pods)
+
+	if batchSbx.Status.Phase == sandboxv1alpha1.BatchSandboxPhasePaused {
+		r.deleteTaskScheduler(ctx, batchSbx)
 	}
 
-	if taskStrategy.NeedTaskScheduling() {
+	if taskStrategy.NeedTaskScheduling() && batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhasePaused {
 		ts, err := r.reconcileTasks(ctx, batchSbx, pods)
 		if err != nil {
 			aggErrors = append(aggErrors, err)
 		} else if ts != nil {
-			newStatus.TaskRunning = ts.Running
-			newStatus.TaskFailed = ts.Failed
-			newStatus.TaskSucceed = ts.Succeed
-			newStatus.TaskUnknown = ts.Unknown
-			newStatus.TaskPending = ts.Pending
+			runtimeView.status.TaskRunning = ts.Running
+			runtimeView.status.TaskFailed = ts.Failed
+			runtimeView.status.TaskSucceed = ts.Succeed
+			runtimeView.status.TaskUnknown = ts.Unknown
+			runtimeView.status.TaskPending = ts.Pending
 		}
 	}
 
-	if !equality.Semantic.DeepEqual(*newStatus, batchSbx.Status) {
-		log.Info("To update BatchSandbox status", "replicas", newStatus.Replicas, "allocated", newStatus.Allocated, "ready", newStatus.Ready)
-		patchData, err := json.Marshal(map[string]any{
-			"status": map[string]any{
-				"replicas":           newStatus.Replicas,
-				"allocated":          newStatus.Allocated,
-				"ready":              newStatus.Ready,
-				"observedGeneration": newStatus.ObservedGeneration,
-				"taskRunning":        newStatus.TaskRunning,
-				"taskFailed":         newStatus.TaskFailed,
-				"taskSucceed":        newStatus.TaskSucceed,
-				"taskUnknown":        newStatus.TaskUnknown,
-				"taskPending":        newStatus.TaskPending,
-			},
-		})
-		if err != nil {
-			aggErrors = append(aggErrors, err)
-		} else if err := r.Status().Patch(ctx, batchSbx, client.RawPatch(types.MergePatchType, patchData)); err != nil {
-			aggErrors = append(aggErrors, err)
-		}
-	}
+	aggErrors = append(aggErrors, r.persistRuntimeView(ctx, batchSbx, runtimeView)...)
 
 	return reconcile.Result{RequeueAfter: DurationStore.Pop(req.String())}, gerrors.Join(aggErrors...)
 }
@@ -392,15 +358,26 @@ func (r *BatchSandboxReconciler) getTaskScheduler(ctx context.Context, batchSbx 
 		}
 		// Update the pods list for this scheduler
 		tSch.UpdatePods(pods)
+		// Handle scale-out: register task specs for any replicas added since the
+		// scheduler was first created. Already-tracked task names are skipped.
+		taskStrategy := strategy.NewTaskSchedulingStrategy(batchSbx)
+		taskSpecs, err := taskStrategy.GenerateTaskSpecs()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate task specs for scale-out: %w", err)
+		}
+		if err := tSch.AddTasks(taskSpecs); err != nil {
+			return nil, fmt.Errorf("failed to add tasks on scale-out: %w", err)
+		}
 	}
 	return tSch, nil
 }
 
 func (r *BatchSandboxReconciler) deleteTaskScheduler(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox) {
-	log := logf.FromContext(ctx)
-	log.Info("delete task scheduler")
 	key := types.NamespacedName{Namespace: batchSbx.Namespace, Name: batchSbx.Name}.String()
-	r.taskSchedulers.Delete(key)
+	if _, ok := r.taskSchedulers.LoadAndDelete(key); ok {
+		log := logf.FromContext(ctx)
+		log.Info("delete task scheduler")
+	}
 }
 
 func (r *BatchSandboxReconciler) scheduleTasks(ctx context.Context, tSch taskscheduler.TaskScheduler, batchSbx *sandboxv1alpha1.BatchSandbox) (*taskScheduleResult, error) {
@@ -549,6 +526,7 @@ func (r *BatchSandboxReconciler) scaleBatchSandbox(ctx context.Context, batchSan
 			return err
 		}
 		pod.Labels[LabelBatchSandboxPodIndexKey] = strconv.Itoa(idx)
+		pod.Labels[LabelBatchSandboxNameKey] = batchSandbox.Name
 		pod.Namespace = batchSandbox.Namespace
 		pod.Name = fmt.Sprintf("%s-%d", batchSandbox.Name, idx)
 		BatchSandboxScaleExpectations.ExpectScale(controllerutils.GetControllerKey(batchSandbox), expectations.Create, pod.Name)
@@ -579,6 +557,7 @@ func (r *BatchSandboxReconciler) SetupWithManager(mgr ctrl.Manager, maxConcurren
 		For(&sandboxv1alpha1.BatchSandbox{}).
 		Named("batchsandbox").
 		Owns(&corev1.Pod{}).
+		Owns(&sandboxv1alpha1.SandboxSnapshot{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}).
 		Complete(r)
 }

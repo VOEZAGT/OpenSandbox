@@ -23,13 +23,16 @@ max_sandbox_timeout_seconds = 86400
 
 # Optional: Uncomment to enable API key authentication
 # api_key = "your-secret-api-key"
+# If api_key stays empty, startup requires explicit acknowledgment:
+# - Interactive TTY: type YES when prompted
+# - Non-interactive: set OPENSANDBOX_INSECURE_SERVER=YES
 
 [log]
 level = "INFO"
 
 [runtime]
 type = "docker"
-execd_image = "opensandbox/execd:v1.0.12"
+execd_image = "opensandbox/execd:v1.0.14"
 
 [storage]
 # Allowlist of host path prefixes permitted for bind mounts.
@@ -39,6 +42,10 @@ allowed_host_paths = []
 
 # Default storage size for auto-created Kubernetes PVCs (when caller omits size).
 volume_default_size = "1Gi"
+
+[store]
+type = "sqlite"
+path = "~/.opensandbox/opensandbox.db"
 
 [docker]
 network_mode = "bridge"
@@ -56,7 +63,7 @@ seccomp_profile = ""
 mode = "direct"
 
 [egress]
-image = "opensandbox/egress:v1.0.8"
+image = "opensandbox/egress:v1.0.10"
 mode = "dns"
 
 # 🧪 [EXPERIMENTAL] Renew-on-access. Off by default — see server/README.md.

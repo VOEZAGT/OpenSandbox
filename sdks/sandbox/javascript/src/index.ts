@@ -30,10 +30,13 @@ export { ConnectionConfig } from "./config/connection.js";
 export type { ConnectionConfigOptions, ConnectionProtocol } from "./config/connection.js";
 
 export type {
+  CreateSnapshotRequest,
   CreateSandboxRequest,
   CreateSandboxResponse,
   Endpoint,
   Host,
+  ListSnapshotsParams,
+  ListSnapshotsResponse,
   ListSandboxesParams,
   ListSandboxesResponse,
   NetworkPolicy,
@@ -44,6 +47,9 @@ export type {
   PVC,
   RenewSandboxExpirationRequest,
   RenewSandboxExpirationResponse,
+  SnapshotInfo,
+  SnapshotState,
+  SnapshotStatus,
   SandboxId,
   SandboxInfo,
   Volume,

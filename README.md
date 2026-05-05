@@ -19,6 +19,9 @@
   <a href="https://www.apache.org/licenses/LICENSE-2.0.html">
     <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="license" />
   </a>
+  <a href="https://www.bestpractices.dev/projects/12588">
+    <img src="https://www.bestpractices.dev/projects/12588/badge" alt="OpenSSF Best Practices" />
+  </a>
   <a href="https://badge.fury.io/py/opensandbox">
     <img src="https://badge.fury.io/py/opensandbox.svg" alt="PyPI version" />
   </a>
@@ -290,6 +293,7 @@ For detailed architecture, see [docs/architecture.md](docs/architecture.md).
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) – Overall architecture & design philosophy
+- [docs/release-verification.md](docs/release-verification.md) - Release signing and artifact verification
 - [oseps/README.md](oseps/README.md) – OpenSandbox Enhancement Proposals
 - SDK
   - Sandbox base SDK ([Java/Kotlin SDK](sdks/sandbox/kotlin/README.md), [Python SDK](sdks/sandbox/python/README.md), [JavaScript/TypeScript SDK](sdks/sandbox/javascript/README.md), [C#/.NET SDK](sdks/sandbox/csharp/README.md)), [Go SDK](sdks/sandbox/go/README.md) - includes sandbox lifecycle, command execution, file operations
@@ -298,32 +302,22 @@ For detailed architecture, see [docs/architecture.md](docs/architecture.md).
 - [sdks/mcp/sandbox/python/README.md](sdks/mcp/sandbox/python/README.md) - MCP server installation and client setup
 - [specs/README.md](specs/README.md) - OpenAPI definitions for sandbox lifecycle API and sandbox execution API
 - [server/README.md](server/README.md) - Sandbox server startup and configuration; supports Docker and Kubernetes runtimes
+- [ROADMAP.md](ROADMAP.md) - Lightweight project roadmap and planning process
 
 ## License
 
 This project is open source under the [Apache 2.0 License](LICENSE).
 
-## Roadmap [2026.03]
+## Roadmap
 
-### SDK
-
-- [x] **Sandbox client connection pool** - Client-side sandbox connection pool management, providing pre-provisioned sandboxes to obtain an environment at X ms. Implemented for Kotlin `SandboxPool` and documented in the [Kotlin SDK README](sdks/sandbox/kotlin/README.md#6-sandbox-pool-client-side). Related PRs: [#301](https://github.com/alibaba/OpenSandbox/pull/301), [#393](https://github.com/alibaba/OpenSandbox/pull/393), [#617](https://github.com/alibaba/OpenSandbox/pull/617).
-- [x] **Go SDK** - Go client SDK for sandbox lifecycle management, command execution, and file operations. See the [Go SDK README](sdks/sandbox/go/README.md). Related PRs: [#597](https://github.com/alibaba/OpenSandbox/pull/597), [#683](https://github.com/alibaba/OpenSandbox/pull/683), [#707](https://github.com/alibaba/OpenSandbox/pull/707).
-
-### Sandbox Runtime
-
-- [x] **Persistent volumes** - Mountable persistent volumes for sandboxes. See [Proposal 0003](oseps/0003-volume-and-volumebinding-support.md), [Docker PVC / named volumes](examples/docker-pvc-volume-mount/README.md), [Docker OSSFS](examples/docker-ossfs-volume-mount/README.md), and [Kubernetes PVC](examples/kubernetes-pvc-volume-mount/README.md). Related PRs: [#166](https://github.com/alibaba/OpenSandbox/pull/166), [#233](https://github.com/alibaba/OpenSandbox/pull/233), [#424](https://github.com/alibaba/OpenSandbox/pull/424), [#515](https://github.com/alibaba/OpenSandbox/pull/515), [#563](https://github.com/alibaba/OpenSandbox/pull/563).
-- [ ] **Local lightweight sandbox** - Lightweight sandbox for AI tools running directly on PCs.
-- [x] **Secure Container** - Secure sandbox for AI Agents running inside container. See the [Secure Container Runtime Guide](docs/secure-container.md). Related PRs: [#177](https://github.com/alibaba/OpenSandbox/pull/177), [#249](https://github.com/alibaba/OpenSandbox/pull/249), [#417](https://github.com/alibaba/OpenSandbox/pull/417).
-
-### Deployment
-
-- [x] **Guide** - Deployment guide for self-hosted Kubernetes cluster. See the [Kubernetes README](kubernetes/README.md) and Helm chart docs in [kubernetes/charts/](kubernetes/charts/). Related PRs: [#232](https://github.com/alibaba/OpenSandbox/pull/232), [#302](https://github.com/alibaba/OpenSandbox/pull/302), [#342](https://github.com/alibaba/OpenSandbox/pull/342).
+See [ROADMAP.md](ROADMAP.md) for the current project roadmap, planning scope,
+and how roadmap items are managed.
 
 ## Contact and Discussion
 
 - Issues: Submit bugs, feature requests, or design discussions through GitHub Issues
 - DingTalk: Join the [OpenSandbox technical discussion group](https://qr.dingtalk.com/action/joingroup?code=v1,k1,A4Bgl5q1I1eNU/r33D18YFNrMY108aFF38V+r19RJOM=&_dt_no_comment=1&origin=11)
+
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=alibaba/OpenSandbox&type=date&legend=top-left)](https://www.star-history.com/#alibaba/OpenSandbox&type=date&legend=top-left)

@@ -21,9 +21,6 @@ import (
 	"time"
 )
 
-// Note: the generated lifecycle client is available at
-// opensandbox/api/lifecycle/ for consumers who prefer the raw generated interface.
-
 // SandboxState represents the high-level lifecycle state of a sandbox.
 type SandboxState string
 
@@ -80,7 +77,12 @@ type Host struct {
 
 // PVC represents a platform-managed named volume backend.
 type PVC struct {
-	ClaimName string `json:"claimName"`
+	ClaimName                  string   `json:"claimName"`
+	CreateIfNotExists          *bool    `json:"createIfNotExists,omitempty"`
+	DeleteOnSandboxTermination *bool    `json:"deleteOnSandboxTermination,omitempty"`
+	StorageClass               *string  `json:"storageClass,omitempty"`
+	Storage                    *string  `json:"storage,omitempty"`
+	AccessModes                []string `json:"accessModes,omitempty"`
 }
 
 // OSSFS represents an Alibaba Cloud OSS mount backend via ossfs.
@@ -107,12 +109,14 @@ type NetworkRule struct {
 
 // CreateSandboxRequest is the request body for creating a new sandbox.
 type CreateSandboxRequest struct {
-	Image          ImageSpec         `json:"image"`
+	Image          *ImageSpec        `json:"image,omitempty"`
+	SnapshotID     string            `json:"snapshotId,omitempty"`
 	Timeout        *int              `json:"timeout,omitempty"`
 	ResourceLimits ResourceLimits    `json:"resourceLimits"`
 	Env            map[string]string `json:"env,omitempty"`
+	SecureAccess   bool              `json:"secureAccess,omitempty"`
 	Metadata       map[string]string `json:"metadata,omitempty"`
-	Entrypoint     []string          `json:"entrypoint"`
+	Entrypoint     []string          `json:"entrypoint,omitempty"`
 	NetworkPolicy  *NetworkPolicy    `json:"networkPolicy,omitempty"`
 	Volumes        []Volume          `json:"volumes,omitempty"`
 	Extensions     map[string]string `json:"extensions,omitempty"`
@@ -123,11 +127,40 @@ type CreateSandboxRequest struct {
 type SandboxInfo struct {
 	ID         string            `json:"id"`
 	Image      *ImageSpec        `json:"image,omitempty"`
+	SnapshotID string            `json:"snapshotId,omitempty"`
 	Status     SandboxStatus     `json:"status"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
 	Entrypoint []string          `json:"entrypoint"`
 	ExpiresAt  *time.Time        `json:"expiresAt,omitempty"`
 	CreatedAt  time.Time         `json:"createdAt"`
+}
+
+type SnapshotState string
+
+const (
+	SnapshotStateCreating SnapshotState = "Creating"
+	SnapshotStateDeleting SnapshotState = "Deleting"
+	SnapshotStateReady    SnapshotState = "Ready"
+	SnapshotStateFailed   SnapshotState = "Failed"
+)
+
+type SnapshotStatus struct {
+	State            SnapshotState `json:"state"`
+	Reason           string        `json:"reason,omitempty"`
+	Message          string        `json:"message,omitempty"`
+	LastTransitionAt *time.Time    `json:"lastTransitionAt,omitempty"`
+}
+
+type SnapshotInfo struct {
+	ID        string         `json:"id"`
+	SandboxID string         `json:"sandboxId"`
+	Name      string         `json:"name,omitempty"`
+	Status    SnapshotStatus `json:"status"`
+	CreatedAt time.Time      `json:"createdAt"`
+}
+
+type CreateSnapshotRequest struct {
+	Name string `json:"name,omitempty"`
 }
 
 // PaginationInfo contains pagination metadata for list responses.
@@ -143,6 +176,18 @@ type PaginationInfo struct {
 type ListSandboxesResponse struct {
 	Items      []SandboxInfo  `json:"items"`
 	Pagination PaginationInfo `json:"pagination"`
+}
+
+type ListSnapshotsResponse struct {
+	Items      []SnapshotInfo `json:"items"`
+	Pagination PaginationInfo `json:"pagination"`
+}
+
+type ListSnapshotsOptions struct {
+	SandboxID string
+	States    []SnapshotState
+	Page      int
+	PageSize  int
 }
 
 // Endpoint describes a public access endpoint for a service running inside
@@ -161,9 +206,6 @@ type RenewExpirationRequest struct {
 type RenewExpirationResponse struct {
 	ExpiresAt time.Time `json:"expiresAt"`
 }
-
-// Egress types are hand-written: generated egress spec types use *string which hurts
-// ergonomics. The generated client is at opensandbox/api/egress/.
 
 // PolicyStatusResponse is the response from the egress policy endpoints.
 type PolicyStatusResponse struct {
@@ -201,7 +243,7 @@ func (e *APIError) Error() string {
 }
 
 // Execd types are hand-written: execd uses SSE streaming, multipart upload, and
-// text responses not representable in a generated client.
+// text responses that do not fit this SDK's higher-level API ergonomics.
 
 // CodeContext represents a code execution context identifier and language.
 type CodeContext struct {

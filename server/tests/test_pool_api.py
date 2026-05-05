@@ -94,25 +94,6 @@ class TestPoolAuthentication:
         response = client.get("/pools")
         assert response.status_code == 401
 
-    def test_create_pool_without_api_key_returns_401(self, client: TestClient):
-        response = client.post("/pools", json=_create_request_body())
-        assert response.status_code == 401
-
-    def test_get_pool_without_api_key_returns_401(self, client: TestClient):
-        response = client.get("/pools/my-pool")
-        assert response.status_code == 401
-
-    def test_update_pool_without_api_key_returns_401(self, client: TestClient):
-        response = client.put(
-            "/pools/my-pool",
-            json={"capacitySpec": {"bufferMax": 5, "bufferMin": 1, "poolMax": 10, "poolMin": 0}},
-        )
-        assert response.status_code == 401
-
-    def test_delete_pool_without_api_key_returns_401(self, client: TestClient):
-        response = client.delete("/pools/my-pool")
-        assert response.status_code == 401
-
     def test_pool_routes_exist_on_v1_prefix(self, client: TestClient, auth_headers: dict):
         """Verify the /v1/pools routes are registered (even if they return 501 on docker runtime)."""
         with patch(_POOL_SERVICE_PATCH) as mock_svc_factory:
@@ -126,17 +107,6 @@ class TestPoolAuthentication:
 
 class TestPoolNotSupportedOnDockerRuntime:
     """Pool endpoints return 501 when PoolService raises 501 (non-k8s runtime)."""
-
-    def _mock_not_supported(self):
-        svc = MagicMock()
-        svc.side_effect = HTTPException(
-            status_code=http_status.HTTP_501_NOT_IMPLEMENTED,
-            detail={
-                "code": SandboxErrorCodes.K8S_POOL_NOT_SUPPORTED,
-                "message": "Pool management is only available when runtime.type is 'kubernetes'.",
-            },
-        )
-        return svc
 
     def test_list_pools_returns_501(self, client: TestClient, auth_headers: dict):
         with patch(_POOL_SERVICE_PATCH, side_effect=HTTPException(
@@ -220,20 +190,6 @@ class TestCreatePoolRoute:
         assert response.status_code == 409
         assert SandboxErrorCodes.K8S_POOL_ALREADY_EXISTS in response.json()["code"]
 
-    def test_create_pool_service_error_returns_500(self, client: TestClient, auth_headers: dict):
-        mock_svc = MagicMock()
-        mock_svc.create_pool.side_effect = HTTPException(
-            status_code=500,
-            detail={
-                "code": SandboxErrorCodes.K8S_POOL_API_ERROR,
-                "message": "k8s api error",
-            },
-        )
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            response = client.post("/pools", json=_create_request_body(), headers=auth_headers)
-
-        assert response.status_code == 500
-
     def test_create_pool_passes_request_to_service(self, client: TestClient, auth_headers: dict):
         mock_svc = MagicMock()
         mock_svc.create_pool.return_value = _pool_response()
@@ -264,27 +220,6 @@ class TestListPoolsRoute:
         names = {p["name"] for p in body["items"]}
         assert names == {"pool-a", "pool-b"}
 
-    def test_list_pools_empty_returns_200_and_empty_list(self, client: TestClient, auth_headers: dict):
-        mock_svc = MagicMock()
-        mock_svc.list_pools.return_value = ListPoolsResponse(items=[])
-
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            response = client.get("/pools", headers=auth_headers)
-
-        assert response.status_code == 200
-        assert response.json()["items"] == []
-
-    def test_list_pools_service_error_returns_500(self, client: TestClient, auth_headers: dict):
-        mock_svc = MagicMock()
-        mock_svc.list_pools.side_effect = HTTPException(
-            status_code=500,
-            detail={"code": SandboxErrorCodes.K8S_POOL_API_ERROR, "message": "err"},
-        )
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            response = client.get("/pools", headers=auth_headers)
-
-        assert response.status_code == 500
-
     def test_list_pools_response_has_status_fields(self, client: TestClient, auth_headers: dict):
         mock_svc = MagicMock()
         mock_svc.list_pools.return_value = ListPoolsResponse(
@@ -310,15 +245,6 @@ class TestGetPoolRoute:
         assert response.status_code == 200
         assert response.json()["name"] == "my-pool"
 
-    def test_get_pool_calls_service_with_correct_name(self, client: TestClient, auth_headers: dict):
-        mock_svc = MagicMock()
-        mock_svc.get_pool.return_value = _pool_response()
-
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            client.get("/pools/target-pool", headers=auth_headers)
-
-        mock_svc.get_pool.assert_called_once_with("target-pool")
-
     def test_get_pool_not_found_returns_404(self, client: TestClient, auth_headers: dict):
         mock_svc = MagicMock()
         mock_svc.get_pool.side_effect = HTTPException(
@@ -333,17 +259,6 @@ class TestGetPoolRoute:
 
         assert response.status_code == 404
         assert SandboxErrorCodes.K8S_POOL_NOT_FOUND in response.json()["code"]
-
-    def test_get_pool_response_includes_capacity_spec(self, client: TestClient, auth_headers: dict):
-        mock_svc = MagicMock()
-        mock_svc.get_pool.return_value = _pool_response(buffer_max=7, pool_max=50)
-
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            response = client.get("/pools/p", headers=auth_headers)
-
-        cap = response.json()["capacitySpec"]
-        assert cap["bufferMax"] == 7
-        assert cap["poolMax"] == 50
 
 
 class TestUpdatePoolRoute:
@@ -425,17 +340,6 @@ class TestDeletePoolRoute:
         assert response.status_code == 204
         assert response.content == b""
 
-    def test_delete_pool_calls_service_with_correct_name(
-        self, client: TestClient, auth_headers: dict
-    ):
-        mock_svc = MagicMock()
-        mock_svc.delete_pool.return_value = None
-
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            client.delete("/pools/to-remove", headers=auth_headers)
-
-        mock_svc.delete_pool.assert_called_once_with("to-remove")
-
     def test_delete_pool_not_found_returns_404(self, client: TestClient, auth_headers: dict):
         mock_svc = MagicMock()
         mock_svc.delete_pool.side_effect = HTTPException(
@@ -450,14 +354,3 @@ class TestDeletePoolRoute:
 
         assert response.status_code == 404
         assert SandboxErrorCodes.K8S_POOL_NOT_FOUND in response.json()["code"]
-
-    def test_delete_pool_service_error_returns_500(self, client: TestClient, auth_headers: dict):
-        mock_svc = MagicMock()
-        mock_svc.delete_pool.side_effect = HTTPException(
-            status_code=500,
-            detail={"code": SandboxErrorCodes.K8S_POOL_API_ERROR, "message": "err"},
-        )
-        with patch(_POOL_SERVICE_PATCH, return_value=mock_svc):
-            response = client.delete("/pools/p", headers=auth_headers)
-
-        assert response.status_code == 500

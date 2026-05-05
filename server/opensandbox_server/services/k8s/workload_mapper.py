@@ -17,7 +17,11 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from opensandbox_server.api.schema import ImageSpec, PlatformSpec, Sandbox, SandboxStatus
-from opensandbox_server.services.constants import SANDBOX_ID_LABEL
+from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SANDBOX_SNAPSHOT_ID_LABEL
+
+
+def _is_opensandbox_label(label_key: str) -> bool:
+    return label_key.split("/", 1)[0] == "opensandbox.io"
 
 
 def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandbox:
@@ -33,11 +37,12 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         creation_timestamp = metadata.creation_timestamp
 
     sandbox_id = labels.get(SANDBOX_ID_LABEL, "")
+    snapshot_id = labels.get(SANDBOX_SNAPSHOT_ID_LABEL)
     expires_at = workload_provider.get_expiration(workload)
     status_info = workload_provider.get_status(workload)
 
     user_metadata = {
-        k: v for k, v in labels.items() if not k.startswith("opensandbox.io/")
+        k: v for k, v in labels.items() if not _is_opensandbox_label(k)
     }
 
     image_uri = ""
@@ -55,7 +60,9 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         image_uri = container.image or ""
         entrypoint = container.command or []
 
-    image_spec = ImageSpec(uri=image_uri) if image_uri else ImageSpec(uri="unknown")
+    image_spec = None
+    if not snapshot_id:
+        image_spec = ImageSpec(uri=image_uri) if image_uri else ImageSpec(uri="unknown")
     platform_spec = _extract_platform_from_workload(workload)
     return Sandbox(
         id=sandbox_id,
@@ -69,6 +76,7 @@ def _build_sandbox_from_workload(workload: Any, workload_provider: Any) -> Sandb
         expires_at=expires_at,
         metadata=user_metadata if user_metadata else None,
         image=image_spec,
+        snapshotId=snapshot_id,
         entrypoint=entrypoint,
         platform=platform_spec,
     )

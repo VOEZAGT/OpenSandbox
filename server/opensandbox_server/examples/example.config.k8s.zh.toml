@@ -23,13 +23,16 @@ max_sandbox_timeout_seconds = 86400
 
 # 可选：取消注释以启用 API Key 认证
 # api_key = "your-secret-api-key"
+# 若 api_key 为空，启动时需要显式确认：
+# - 交互式 TTY：按提示输入 YES
+# - 非交互环境：设置 OPENSANDBOX_INSECURE_SERVER=YES
 
 [log]
 level = "INFO"
 
 [runtime]
 type = "kubernetes"
-execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.12"
+execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.14"
 
 [storage]
 # 允许进行 bind mount 的宿主机路径前缀白名单。
@@ -57,6 +60,10 @@ informer_watch_timeout_seconds = 60
 # If not specified, uses the first registered provider (typically "batchsandbox")
 workload_provider = "batchsandbox"
 
+# BatchSandbox 主容器的镜像拉取策略。
+# 可选值："Always"、"IfNotPresent"、"Never"。
+image_pull_policy = "IfNotPresent"
+
 # Path to the BatchSandbox template file
 # Replace with your path
 batchsandbox_template_file = "~/batchsandbox-template.yaml"
@@ -65,7 +72,7 @@ batchsandbox_template_file = "~/batchsandbox-template.yaml"
 mode = "direct"
 
 [egress]
-image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.0.8"
+image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.0.10"
 mode = "dns"
 # Default is true (recommended for dual-stack CNI). Set false only if you need IPv6 in the netns (see server/configuration.md).
 # disable_ipv6 = false

@@ -81,6 +81,36 @@ test("Sandbox.create omits timeout when timeoutSeconds is null", async () => {
   assert.ok(!Object.hasOwn(recordedRequests[0], "timeout"));
 });
 
+test("Sandbox.create forwards secureAccess", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    secureAccess: true,
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].secureAccess, true);
+});
+
+test("Sandbox.create forwards windows platform values", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    platform: { os: "windows", arch: "amd64" },
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.deepEqual(recordedRequests[0].platform, { os: "windows", arch: "amd64" });
+});
+
 test("Sandbox.create floors finite timeoutSeconds", async () => {
   const { adapterFactory, recordedRequests } = createAdapterFactory();
 
@@ -124,6 +154,62 @@ test("Sandbox.create rejects non-finite timeoutSeconds", async () => {
       /timeoutSeconds must be a finite number/
     );
   }
+});
+
+test("Sandbox.create restores from snapshot without entrypoint", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    snapshotId: "snap-123",
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].snapshotId, "snap-123");
+  assert.equal(recordedRequests[0].image, undefined);
+  assert.deepEqual(recordedRequests[0].entrypoint, ["tail", "-f", "/dev/null"]);
+});
+
+test("Sandbox.create restores from snapshot with explicit entrypoint", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    snapshotId: "snap-123",
+    entrypoint: ["python", "app.py"],
+    skipHealthCheck: true,
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].snapshotId, "snap-123");
+  assert.deepEqual(recordedRequests[0].entrypoint, ["python", "app.py"]);
+});
+
+test("Sandbox.create requires exactly one startup source", async () => {
+  const { adapterFactory } = createAdapterFactory();
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      skipHealthCheck: true,
+    }),
+    /Exactly one of image or snapshotId must be provided/
+  );
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      image: "python:3.12",
+      snapshotId: "snap-123",
+      skipHealthCheck: true,
+    }),
+    /Exactly one of image or snapshotId must be provided/
+  );
 });
 
 test("Sandbox creates and reuses egress service during sandbox lifecycle", async () => {

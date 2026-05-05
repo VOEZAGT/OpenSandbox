@@ -27,6 +27,8 @@ import (
 type SandboxCreateOptions struct {
 	// Image is the container image URI (required).
 	Image string
+	// SnapshotID restores the sandbox from a previously created snapshot.
+	SnapshotID string
 
 	// Entrypoint is the command to run. Defaults to DefaultEntrypoint.
 	Entrypoint []string
@@ -40,6 +42,9 @@ type SandboxCreateOptions struct {
 
 	// Env variables injected into the sandbox.
 	Env map[string]string
+
+	// SecureAccess enables secured access for sandbox endpoints.
+	SecureAccess bool
 
 	// Metadata for filtering and tagging.
 	Metadata map[string]string
@@ -91,8 +96,8 @@ func (s *Sandbox) ID() string { return s.id }
 
 // CreateSandbox creates a new sandbox and waits for it to be ready.
 func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCreateOptions) (*Sandbox, error) {
-	if opts.Image == "" {
-		return nil, &InvalidArgumentError{Field: "Image", Message: "image is required"}
+	if (opts.Image == "") == (opts.SnapshotID == "") {
+		return nil, &InvalidArgumentError{Field: "Image/SnapshotID", Message: "exactly one of image or snapshotID is required"}
 	}
 
 	entrypoint := opts.Entrypoint
@@ -116,15 +121,20 @@ func CreateSandbox(ctx context.Context, config ConnectionConfig, opts SandboxCre
 	lc := config.lifecycleClient()
 
 	req := CreateSandboxRequest{
-		Image:          ImageSpec{URI: opts.Image, Auth: opts.ImageAuth},
+		Image:          nil,
+		SnapshotID:     opts.SnapshotID,
 		Entrypoint:     entrypoint,
 		ResourceLimits: limits,
 		Timeout:        timeout,
 		Env:            opts.Env,
+		SecureAccess:   opts.SecureAccess,
 		Metadata:       opts.Metadata,
 		NetworkPolicy:  opts.NetworkPolicy,
 		Volumes:        opts.Volumes,
 		Extensions:     opts.Extensions,
+	}
+	if opts.Image != "" {
+		req.Image = &ImageSpec{URI: opts.Image, Auth: opts.ImageAuth}
 	}
 
 	created, err := lc.CreateSandbox(ctx, req)
@@ -253,10 +263,21 @@ func (s *Sandbox) Renew(ctx context.Context, duration time.Duration) (*RenewExpi
 	return s.lifecycle.RenewExpiration(ctx, s.id, time.Now().Add(duration))
 }
 
+// CreateSnapshot creates a persistent snapshot from this sandbox.
+func (s *Sandbox) CreateSnapshot(ctx context.Context, req CreateSnapshotRequest) (*SnapshotInfo, error) {
+	return s.lifecycle.CreateSnapshot(ctx, s.id, req)
+}
+
 // GetEndpoint retrieves the public access endpoint for a service port.
 func (s *Sandbox) GetEndpoint(ctx context.Context, port int) (*Endpoint, error) {
 	useProxy := s.config.UseServerProxy
 	return s.lifecycle.GetEndpoint(ctx, s.id, port, &useProxy)
+}
+
+// GetSignedEndpoint retrieves a signed endpoint URL with an OSEP-0011 route
+// token that expires at the given Unix epoch timestamp (seconds).
+func (s *Sandbox) GetSignedEndpoint(ctx context.Context, port int, expires int64) (*Endpoint, error) {
+	return s.lifecycle.GetSignedEndpoint(ctx, s.id, port, expires)
 }
 
 // ReadyOptions configures WaitUntilReady behavior.

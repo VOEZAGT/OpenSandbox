@@ -25,12 +25,12 @@ import com.alibaba.opensandbox.codeinterpreter.domain.models.execd.executions.Su
 import com.alibaba.opensandbox.sandbox.Sandbox;
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.*;
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.*;
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.*;
-import java.lang.reflect.Method;
 import org.junit.jupiter.api.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -91,8 +91,7 @@ public class CodeInterpreterE2ETest extends BaseE2ETest {
 
     @BeforeEach
     void maybeRecreateInterpreterForHighFlakinessTests(TestInfo testInfo) {
-        String methodName =
-                testInfo.getTestMethod().map(Method::getName).orElse("");
+        String methodName = testInfo.getTestMethod().map(Method::getName).orElse("");
         if (!shouldIsolatePerTest(methodName)) {
             isolatedSandboxForCurrentTest = false;
             return;
@@ -144,6 +143,8 @@ public class CodeInterpreterE2ETest extends BaseE2ETest {
                         .env("NODE_VERSION", "22")
                         .env("PYTHON_VERSION", "3.12")
                         .env("EXECD_LOG_FILE", "/tmp/opensandbox-e2e/logs/execd.log")
+                        .env("EXECD_API_GRACE_SHUTDOWN", "3s")
+                        .env("EXECD_JUPYTER_IDLE_POLL_INTERVAL", "200ms")
                         .healthCheckPollingInterval(Duration.ofMillis(500))
                         .volume(volume)
                         .build();

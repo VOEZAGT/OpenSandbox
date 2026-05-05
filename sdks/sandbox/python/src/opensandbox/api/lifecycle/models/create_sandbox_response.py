@@ -37,13 +37,15 @@ T = TypeVar("T", bound="CreateSandboxResponse")
 
 @_attrs_define
 class CreateSandboxResponse:
-    """Response from creating a new sandbox. Contains essential information without image and updatedAt.
+    """Response from creating a new sandbox. Contains essential information without startup source details and updatedAt.
 
     Attributes:
         id (str): Unique sandbox identifier
         status (SandboxStatus): Detailed status information with lifecycle state and transition details
         created_at (datetime.datetime): Sandbox creation timestamp
-        entrypoint (list[str]): Entry process specification from creation request
+        entrypoint (list[str]): Entry process specification for the sandbox. For image-created sandboxes,
+            this is copied from the creation request. For snapshot-created sandboxes,
+            this is restored from the snapshot.
         metadata (CreateSandboxResponseMetadata | Unset): Custom metadata from creation request
         platform (PlatformSpec | Unset): Runtime platform constraint used for scheduling/provisioning.
 
@@ -51,7 +53,10 @@ class CreateSandboxResponse:
             OS and CPU architecture for sandbox execution.
 
             Behavioral notes:
-            - If omitted, runtime uses existing default behavior (backward compatible).
+            - If omitted, the runtime applies its own default platform selection behavior.
+              For Docker, requests are created without an explicit platform override.
+              For Kubernetes, no `kubernetes.io/os` or `kubernetes.io/arch` constraint
+              is injected unless provided by request or workload template.
             - If provided and cannot be satisfied by runtime/template/pool constraints,
               request must fail explicitly.
         expires_at (datetime.datetime | Unset): Timestamp when sandbox will auto-terminate. Omitted when manual cleanup

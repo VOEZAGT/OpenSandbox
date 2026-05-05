@@ -16,7 +16,6 @@ package mitmproxy
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"os/user"
@@ -27,32 +26,31 @@ import (
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
+	"github.com/alibaba/opensandbox/internal/safego"
 )
 
 const RunAsUser = "mitmproxy"
 
-// listenHostLoopback binds mitmdump to loopback only. Transparent mode receives traffic via iptables REDIRECT
-// to this port; listening on 0.0.0.0 would expose an open proxy to any interface in the netns.
+// Loopback: transparent mode receives via REDIRECT; do not listen on 0.0.0.0 in the netns.
 const listenHostLoopback = "127.0.0.1"
 
-// Config controls mitmdump --mode transparent.
+// Config: mitmdump --mode transparent; UserName must match iptables ! --uid-owner, ConfDir is mitm state/CA.
 type Config struct {
 	ListenPort int
-	// UserName is the passwd entry used to run mitmdump (must match iptables ! --uid-owner).
-	UserName string
-	// ConfDir is passed as --set confdir=... (CA and state).
-	ConfDir string
-	// ScriptPath optional mitmproxy script (-s) for addons (e.g. inject headers).
+	UserName   string
+	ConfDir    string
 	ScriptPath string
+	// OnExit is called (if non-nil) when mitmdump exits. Called from a background goroutine.
+	OnExit func(error)
 }
 
-// Running is a started mitmdump. Call GracefulShutdown before process exit to send SIGTERM and reap it.
+// Running: child mitmdump; use GracefulShutdown to SIGTERM+reap before process exit.
 type Running struct {
 	Cmd  *exec.Cmd
 	done chan error
 }
 
-func LookupUser(userName string) (uid, gid int, home string, err error) {
+func LookupUser(userName string) (uid, gid uint32, home string, err error) {
 	if strings.TrimSpace(userName) == "" {
 		userName = RunAsUser
 	}
@@ -68,16 +66,10 @@ func LookupUser(userName string) (uid, gid int, home string, err error) {
 	if err != nil {
 		return 0, 0, "", err
 	}
-	if uid64 > uint64(math.MaxInt) {
-		return 0, 0, "", fmt.Errorf("mitmproxy: UID %d overflows int", uid64)
-	}
-	if gid64 > uint64(math.MaxInt) {
-		return 0, 0, "", fmt.Errorf("mitmproxy: GID %d overflows int", gid64)
-	}
-	return int(uid64), int(gid64), u.HomeDir, nil
+	return uint32(uid64), uint32(gid64), u.HomeDir, nil
 }
 
-// Launch starts mitmdump and returns immediately after the process is running.
+// Launch starts mitmdump in the background; check Wait/GracefulShutdown on the returned Running.
 func Launch(cfg Config) (*Running, error) {
 	if runtime.GOOS != "linux" {
 		return nil, fmt.Errorf("mitmproxy: transparent mitmdump is only supported on linux")
@@ -106,6 +98,10 @@ func Launch(cfg Config) (*Running, error) {
 		trustDir = "/etc/ssl/certs"
 	}
 	args = append(args, "--set", "ssl_verify_upstream_trusted_confdir="+trustDir)
+
+	// Stream large bodies instead of buffering them in memory (OOM prevention).
+	args = append(args, "--set", "stream_large_bodies=1m")
+
 	homeEnv := home
 	if strings.TrimSpace(cfg.ConfDir) != "" {
 		cd := strings.TrimSpace(cfg.ConfDir)
@@ -116,8 +112,7 @@ func Launch(cfg Config) (*Running, error) {
 		args = append(args, "-s", strings.TrimSpace(cfg.ScriptPath))
 	}
 
-	// Passthrough: no TLS interception for matching host/IP (regex). Each pattern -> --set ignore_hosts=...
-	// https://docs.mitmproxy.org/stable/concepts/options/ — transparent mode often works better with IP ranges.
+	// Upstream passthrough: each pattern becomes --set ignore_hosts= (regex; IP ranges are practical in transparent mode).
 	for _, p := range strings.Split(os.Getenv(constants.EnvMitmproxyIgnoreHosts), ";") {
 		p = strings.TrimSpace(p)
 		if p == "" {
@@ -130,7 +125,7 @@ func Launch(cfg Config) (*Running, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)},
+		Credential: &syscall.Credential{Uid: uid, Gid: gid},
 	}
 	cmd.Env = append(os.Environ(), "HOME="+homeEnv)
 
@@ -138,9 +133,14 @@ func Launch(cfg Config) (*Running, error) {
 		return nil, fmt.Errorf("mitmproxy: start mitmdump: %w", err)
 	}
 	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
+	onExit := cfg.OnExit
+	safego.Go(func() {
+		err := cmd.Wait()
+		done <- err
+		if onExit != nil {
+			onExit(err)
+		}
+	})
 
 	log.Infof("[mitmproxy] mitmdump started (pid %d, transparent on %s:%d)", cmd.Process.Pid, listenHostLoopback, cfg.ListenPort)
 	return &Running{Cmd: cmd, done: done}, nil

@@ -31,6 +31,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxImageSpec
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxMetrics
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import com.alibaba.opensandbox.sandbox.domain.services.Commands
 import com.alibaba.opensandbox.sandbox.domain.services.Egress
@@ -179,6 +180,7 @@ class Sandbox internal constructor(
             timeout: Duration,
             healthCheckPollingInterval: Duration,
             skipHealthCheck: Boolean,
+            execdPort: Int = DEFAULT_EXECD_PORT,
             initAction: (Sandboxes) -> InitializationResult,
         ): Sandbox {
             logger.info("Starting {} operation", operationName)
@@ -197,7 +199,7 @@ class Sandbox internal constructor(
                 val execdEndpoint =
                     sandboxService.getSandboxEndpoint(
                         sandboxId,
-                        DEFAULT_EXECD_PORT,
+                        execdPort,
                         connectionConfig.useServerProxy,
                     )
                 val fileSystemService = factory.createFilesystem(execdEndpoint)
@@ -276,6 +278,7 @@ class Sandbox internal constructor(
          * @param readyTimeout Timeout for waiting for sandbox readiness
          * @param resource Resource limits (optional)
          * @param networkPolicy Optional outbound network policy (egress)
+         * @param secureAccess Whether to enable secured access for sandbox endpoints
          * @param connectionConfig Connection configuration
          * @param healthCheck Custom health check function (optional)
          * @param healthCheckPollingInterval Polling interval for readiness/health check
@@ -285,8 +288,9 @@ class Sandbox internal constructor(
          * @throws SandboxException if sandbox creation or initialization fails
          */
         private fun create(
-            imageSpec: SandboxImageSpec,
-            entrypoint: List<String>,
+            imageSpec: SandboxImageSpec?,
+            entrypoint: List<String>?,
+            snapshotId: String?,
             env: Map<String, String>,
             metadata: Map<String, String>,
             timeout: Duration?,
@@ -294,6 +298,7 @@ class Sandbox internal constructor(
             resource: Map<String, String>,
             platform: PlatformSpec?,
             networkPolicy: NetworkPolicy?,
+            secureAccess: Boolean,
             connectionConfig: ConnectionConfig,
             healthCheck: ((Sandbox) -> Boolean)? = null,
             healthCheckPollingInterval: Duration,
@@ -303,7 +308,7 @@ class Sandbox internal constructor(
         ): Sandbox {
             val timeoutLabel = if (timeout != null) "${timeout.seconds}s" else "manual-cleanup"
             return initializeSandbox(
-                operationName = "create sandbox with image ${imageSpec.image} (timeout: $timeoutLabel)",
+                operationName = "create sandbox with startup source ${imageSpec?.image ?: snapshotId} (timeout: $timeoutLabel)",
                 connectionConfig = connectionConfig,
                 healthCheck = healthCheck,
                 timeout = readyTimeout,
@@ -322,6 +327,8 @@ class Sandbox internal constructor(
                         extensions,
                         volumes,
                         platform,
+                        secureAccess,
+                        snapshotId,
                     )
                 InitializationResult.NewSandbox(response.id)
             }
@@ -344,6 +351,7 @@ class Sandbox internal constructor(
             connectTimeout: Duration,
             healthCheckPollingInterval: Duration,
             skipHealthCheck: Boolean,
+            execdPort: Int = DEFAULT_EXECD_PORT,
         ): Sandbox {
             return initializeSandbox(
                 operationName = "connect to sandbox $sandboxId",
@@ -352,6 +360,7 @@ class Sandbox internal constructor(
                 timeout = connectTimeout,
                 healthCheckPollingInterval = healthCheckPollingInterval,
                 skipHealthCheck = skipHealthCheck,
+                execdPort = execdPort,
             ) { _ ->
                 InitializationResult.ExistingSandbox(sandboxId)
             }
@@ -417,6 +426,20 @@ class Sandbox internal constructor(
     }
 
     /**
+     * Gets a signed endpoint for a service port with an OSEP-0011 route token.
+     *
+     * @param port The port number to get the endpoint for
+     * @param expires Unix epoch seconds for the signed route token expiry
+     * @return Signed endpoint information
+     */
+    fun getSignedEndpoint(
+        port: Int,
+        expires: Long,
+    ): SandboxEndpoint {
+        return sandboxService.getSignedSandboxEndpoint(id, port, expires, httpClientProvider.config.useServerProxy)
+    }
+
+    /**
      * Gets the current status of this sandbox.
      *
      * @return Current sandbox status including state and metadata
@@ -437,6 +460,8 @@ class Sandbox internal constructor(
         logger.info("Renew sandbox {} timeout, estimated expiration to {}", id, OffsetDateTime.now().plus(timeout))
         return sandboxService.renewSandboxExpiration(id, OffsetDateTime.now().plus(timeout))
     }
+
+    fun createSnapshot(name: String? = null): SnapshotInfo = sandboxService.createSnapshot(id, name)
 
     /**
      * Gets current egress policy for this sandbox.
@@ -650,6 +675,11 @@ class Sandbox internal constructor(
         private var skipHealthCheck: Boolean = false
 
         /**
+         * Custom execd port. Defaults to [DEFAULT_EXECD_PORT] (44772) when not set.
+         */
+        private var execdPort: Int = DEFAULT_EXECD_PORT
+
+        /**
          * Sets the sandbox ID to connect to.
          *
          * @param sandboxId ID of the existing sandbox
@@ -696,6 +726,16 @@ class Sandbox internal constructor(
         }
 
         /**
+         * Sets the execd port used to communicate with the sandbox.
+         *
+         * Defaults to [DEFAULT_EXECD_PORT] (44772) when not set.
+         */
+        fun execdPort(port: Int): Connector {
+            this.execdPort = port
+            return this
+        }
+
+        /**
          * Connects to the existing sandbox with the configured parameters.
          *
          * This method performs the following steps:
@@ -720,6 +760,7 @@ class Sandbox internal constructor(
                 connectTimeout = connectTimeout,
                 healthCheckPollingInterval = healthCheckPollingInterval,
                 skipHealthCheck = skipHealthCheck,
+                execdPort = execdPort,
             )
         }
     }
@@ -767,6 +808,7 @@ class Sandbox internal constructor(
          * Image config
          */
         private var imageSpec: SandboxImageSpec? = null
+        private var snapshotId: String? = null
 
         /**
          * Sandbox entrypoint
@@ -800,6 +842,11 @@ class Sandbox internal constructor(
          * Optional outbound network policy (egress).
          */
         private var networkPolicy: NetworkPolicy? = null
+
+        /**
+         * Enables secured access for sandbox endpoints.
+         */
+        private var secureAccess: Boolean = false
 
         /**
          * Optional runtime platform constraint used for sandbox provisioning.
@@ -848,6 +895,7 @@ class Sandbox internal constructor(
                 SandboxImageSpec.builder()
                     .image(image)
                     .build()
+            this.snapshotId = null
             return this
         }
 
@@ -859,6 +907,16 @@ class Sandbox internal constructor(
          */
         fun imageSpec(imageSpec: SandboxImageSpec): Builder {
             this.imageSpec = imageSpec
+            this.snapshotId = null
+            return this
+        }
+
+        fun snapshotId(snapshotId: String): Builder {
+            if (snapshotId.isBlank()) {
+                throw InvalidArgumentException(message = "Snapshot ID cannot be blank")
+            }
+            this.snapshotId = snapshotId
+            this.imageSpec = null
             return this
         }
 
@@ -1006,6 +1064,18 @@ class Sandbox internal constructor(
             val builder = NetworkPolicy.builder()
             builder.configure()
             this.networkPolicy = builder.build()
+            return this
+        }
+
+        /**
+         * Enables or disables secured access for sandbox endpoints.
+         *
+         * Default is false for backward compatibility. When true, the server may
+         * return required endpoint headers that SDK calls must include.
+         */
+        @JvmOverloads
+        fun secureAccess(enabled: Boolean = true): Builder {
+            this.secureAccess = enabled
             return this
         }
 
@@ -1197,17 +1267,19 @@ class Sandbox internal constructor(
         fun build(): Sandbox {
             // Validate required configuration
             val spec =
-                imageSpec ?: throw InvalidArgumentException(
-                    message = "Sandbox image must be specified",
+                imageSpec
+            if ((spec == null) == (snapshotId == null)) {
+                throw InvalidArgumentException(
+                    message = "Exactly one of sandbox image or snapshotId must be specified",
                 )
-
-            // Validate image specification
-            if (spec.image.isBlank()) {
+            }
+            if (spec != null && spec.image.isBlank()) {
                 throw InvalidArgumentException("Sandbox image cannot be blank")
             }
 
             return create(
                 imageSpec = spec,
+                snapshotId = snapshotId,
                 entrypoint = entrypoint,
                 env = env,
                 metadata = metadata,
@@ -1216,6 +1288,7 @@ class Sandbox internal constructor(
                 resource = resource,
                 platform = platform,
                 networkPolicy = networkPolicy,
+                secureAccess = secureAccess,
                 extensions = extensions,
                 connectionConfig = connectionConfig ?: ConnectionConfig.builder().build(),
                 healthCheckPollingInterval = healthCheckPollingInterval,

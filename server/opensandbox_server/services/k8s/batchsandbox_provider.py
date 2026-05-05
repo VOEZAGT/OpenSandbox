@@ -46,6 +46,12 @@ from opensandbox_server.services.k8s.provider_common import (
     _extract_platform_unschedulable_message_from_pod,
     _workload_platform_constraint_scope,
 )
+from opensandbox_server.services.k8s.windows_profile import (
+    apply_windows_profile_arch_selector,
+    apply_windows_profile_overrides,
+    is_windows_profile,
+    validate_windows_profile_resource_limits,
+)
 from opensandbox_server.services.k8s.volume_helper import apply_volumes_to_pod_spec
 from opensandbox_server.services.k8s.workload_provider import WorkloadProvider
 from opensandbox_server.services.runtime_resolver import SecureRuntimeResolver
@@ -67,8 +73,9 @@ class BatchSandboxProvider(WorkloadProvider):
         k8s_config = app_config.kubernetes if app_config else None
         template_file_path = k8s_config.batchsandbox_template_file if k8s_config else None
         if template_file_path:
-            logger.info("Using BatchSandbox template file: %s", template_file_path)
+            logger.info(f"Using BatchSandbox template file: {template_file_path}")
         self.execd_init_resources = k8s_config.execd_init_resources if k8s_config else None
+        self.image_pull_policy = k8s_config.image_pull_policy if k8s_config else "IfNotPresent"
 
         self.resolver = SecureRuntimeResolver(app_config) if app_config else None
         self.runtime_class = (
@@ -78,7 +85,7 @@ class BatchSandboxProvider(WorkloadProvider):
         self.group = "sandbox.opensandbox.io"
         self.version = "v1alpha1"
         self.plural = "batchsandboxes"
-        
+
         self.template_manager = BatchSandboxTemplateManager(template_file_path)
 
         self.egress_disable_ipv6 = (
@@ -113,13 +120,10 @@ class BatchSandboxProvider(WorkloadProvider):
     ) -> Dict[str, Any]:
         """Create a BatchSandbox in template mode or pool mode."""
         extensions = extensions or {}
+        windows_profile = is_windows_profile(platform)
 
         if self.runtime_class:
-            logger.info(
-                "Using Kubernetes RuntimeClass '%s' for sandbox %s",
-                self.runtime_class,
-                sandbox_id,
-            )
+            logger.info(f"Using Kubernetes RuntimeClass '{self.runtime_class}' for sandbox {sandbox_id}")
 
         if extensions.get("poolRef"):
             if platform is not None:
@@ -142,8 +146,11 @@ class BatchSandboxProvider(WorkloadProvider):
                 env=env,
                 annotations=annotations,
             )
-        
+
         extra_volumes, extra_mounts = self._extract_template_pod_extras()
+
+        if windows_profile:
+            validate_windows_profile_resource_limits(resource_limits)
 
         disable_ipv6_for_egress = (
             network_policy is not None
@@ -161,13 +168,12 @@ class BatchSandboxProvider(WorkloadProvider):
             entrypoint=entrypoint,
             env=env,
             resource_limits=resource_limits,
-            include_execd_volume=True,
             has_network_policy=network_policy is not None,
+            image_pull_policy=self.image_pull_policy,
         )
         
         containers = [_container_to_dict(main_container)]
-        
-        pod_spec: Dict[str, Any] = {
+        pod_spec = {
             "initContainers": [_container_to_dict(init_container)],
             "containers": containers,
             "volumes": [
@@ -177,8 +183,29 @@ class BatchSandboxProvider(WorkloadProvider):
                 }
             ],
         }
-        self._apply_platform_node_selector(pod_spec, platform)
+        if windows_profile:
+            apply_windows_profile_overrides(
+                pod_spec=pod_spec,
+                entrypoint=entrypoint,
+                env=env,
+                resource_limits=resource_limits,
+                disable_ipv6_for_egress=disable_ipv6_for_egress,
+            )
+            template = self.template_manager.get_base_template()
+            template_spec = (
+                template.get("spec", {})
+                .get("template", {})
+                .get("spec", {})
+            )
+            apply_windows_profile_arch_selector(
+                pod_spec=pod_spec,
+                template_spec=template_spec if isinstance(template_spec, dict) else {},
+                platform=platform,
+            )
+        else:
+            self._apply_platform_node_selector(pod_spec, platform)
 
+        containers = pod_spec.get("containers", [])
         if self.runtime_class:
             pod_spec["runtimeClassName"] = self.runtime_class
 
@@ -200,9 +227,14 @@ class BatchSandboxProvider(WorkloadProvider):
         spec: Dict[str, Any] = {
             "replicas": 1,
             "template": {
+                "metadata": {
+                    "labels": labels,
+                    "annotations": annotations or {},
+                },
                 "spec": pod_spec,
             },
         }
+
         runtime_manifest = {
             "apiVersion": f"{self.group}/{self.version}",
             "kind": "BatchSandbox",
@@ -215,17 +247,17 @@ class BatchSandboxProvider(WorkloadProvider):
         }
         if annotations:
             runtime_manifest["metadata"]["annotations"] = annotations
-        
+
         batchsandbox = self.template_manager.merge_with_runtime_values(runtime_manifest)
         if expires_at is None:
             batchsandbox["spec"].pop("expireTime", None)
         else:
             batchsandbox["spec"]["expireTime"] = expires_at.isoformat()
         self._merge_pod_spec_extras(batchsandbox, extra_volumes, extra_mounts)
-        if platform is not None:
+        if platform is not None and not windows_profile:
             merged_pod_spec = batchsandbox.get("spec", {}).get("template", {}).get("spec", {})
             WorkloadProvider.ensure_platform_compatible_with_affinity(merged_pod_spec, platform)
-        
+
         created = self.k8s_client.create_custom_object(
             group=self.group,
             version=self.version,
@@ -245,9 +277,9 @@ class BatchSandboxProvider(WorkloadProvider):
             )
             try:
                 self.k8s_client.create_secret(namespace=namespace, body=secret)
-                logger.info("Created imagePullSecret for sandbox %s", sandbox_id)
+                logger.info(f"Created imagePullSecret for sandbox {sandbox_id}")
             except Exception:
-                logger.warning("Failed to create imagePullSecret for sandbox %s, rolling back BatchSandbox", sandbox_id)
+                logger.warning(f"Failed to create imagePullSecret for sandbox {sandbox_id}, rolling back BatchSandbox")
                 try:
                     self.k8s_client.delete_custom_object(
                         group=self.group,
@@ -258,7 +290,7 @@ class BatchSandboxProvider(WorkloadProvider):
                         grace_period_seconds=0,
                     )
                 except Exception as del_exc:
-                    logger.warning("Failed to rollback BatchSandbox %s: %s", sandbox_id, del_exc)
+                    logger.warning(f"Failed to rollback BatchSandbox {sandbox_id}: {del_exc}")
                 raise
 
         return {
@@ -317,7 +349,7 @@ class BatchSandboxProvider(WorkloadProvider):
         }
         if annotations:
             runtime_manifest["metadata"]["annotations"] = annotations
-        
+
         created = self.k8s_client.create_custom_object(
             group=self.group,
             version=self.version,
@@ -408,9 +440,9 @@ class BatchSandboxProvider(WorkloadProvider):
         user_process_cmd = f"/opt/opensandbox/bin/bootstrap.sh {escaped_entrypoint} &"
         
         wrapped_command = ["/bin/sh", "-c", user_process_cmd]
-        
+
         env_list = [{"name": k, "value": v} for k, v in env.items()] if env else []
-        
+
         return {
             "spec": {
                 "process": {
@@ -419,7 +451,7 @@ class BatchSandboxProvider(WorkloadProvider):
                 }
             }
         }
-    
+
 
     def get_workload(self, sandbox_id: str, namespace: str) -> Optional[Dict[str, Any]]:
         """Get BatchSandbox by sandbox ID."""
@@ -450,7 +482,7 @@ class BatchSandboxProvider(WorkloadProvider):
         batchsandbox = self.get_workload(sandbox_id, namespace)
         if not batchsandbox:
             raise Exception(f"BatchSandbox for sandbox {sandbox_id} not found")
-        
+
         self.k8s_client.delete_custom_object(
             group=self.group,
             version=self.version,
@@ -459,7 +491,7 @@ class BatchSandboxProvider(WorkloadProvider):
             name=batchsandbox["metadata"]["name"],
             grace_period_seconds=0,
         )
-    
+
     def list_workloads(self, namespace: str, label_selector: str) -> List[Dict[str, Any]]:
         """List BatchSandboxes matching label selector."""
         return self.k8s_client.list_custom_objects(
@@ -469,13 +501,71 @@ class BatchSandboxProvider(WorkloadProvider):
             plural=self.plural,
             label_selector=label_selector,
         )
-    
+
+    def patch_workload(self, sandbox_id: str, namespace: str, spec_patch: Dict[str, Any]) -> Dict[str, Any]:
+        """Patch BatchSandbox spec (e.g., spec.pause for pause/resume)."""
+        batchsandbox = self.get_workload(sandbox_id, namespace)
+        if not batchsandbox:
+            return None
+        return self.k8s_client.patch_custom_object(
+            group=self.group,
+            version=self.version,
+            namespace=namespace,
+            plural=self.plural,
+            name=batchsandbox["metadata"]["name"],
+            body=spec_patch,
+        )
+
+    @staticmethod
+    def _has_true_condition(conditions: List[Dict[str, Any]], condition_type: str) -> bool:
+        for cond in conditions:
+            if cond.get("type") == condition_type and cond.get("status") == "True":
+                return True
+        return False
+
+    @staticmethod
+    def _first_true_condition_message(conditions: List[Dict[str, Any]], condition_types: List[str]) -> Optional[str]:
+        for condition_type in condition_types:
+            for cond in conditions:
+                if cond.get("type") == condition_type and cond.get("status") == "True":
+                    message = cond.get("message")
+                    if isinstance(message, str) and message.strip():
+                        return message
+        return None
+
+    def _patch_pause_with_retry_bridge(self, sandbox_id: str, namespace: str, target: Optional[bool]) -> None:
+        self.patch_workload(sandbox_id, namespace, {"spec": {"pause": None}})
+        try:
+            self.patch_workload(sandbox_id, namespace, {"spec": {"pause": target}})
+            return
+        except Exception as exc:
+            current = self.get_workload(sandbox_id, namespace)
+            current_pause = None if not current else current.get("spec", {}).get("pause")
+            if current is not None and current_pause == target:
+                logger.warning(
+                    "BatchSandbox %s retry bridge target patch raised %s but read-back confirmed spec.pause=%s",
+                    sandbox_id,
+                    type(exc).__name__,
+                    target,
+                )
+                return
+
+            logger.warning(
+                "BatchSandbox %s retry bridge target patch raised %s and current spec.pause=%s; retrying target patch once",
+                sandbox_id,
+                type(exc).__name__,
+                current_pause,
+            )
+            retried = self.patch_workload(sandbox_id, namespace, {"spec": {"pause": target}})
+            if retried is None:
+                raise exc
+
     def update_expiration(self, sandbox_id: str, namespace: str, expires_at: datetime) -> None:
         """Update BatchSandbox `spec.expireTime`."""
         batchsandbox = self.get_workload(sandbox_id, namespace)
         if not batchsandbox:
             raise Exception(f"BatchSandbox for sandbox {sandbox_id} not found")
-        
+
         body = {
             "spec": {
                 "expireTime": expires_at.isoformat()
@@ -490,7 +580,100 @@ class BatchSandboxProvider(WorkloadProvider):
             name=batchsandbox["metadata"]["name"],
             body=body,
         )
-    
+
+    def pause_sandbox(self, sandbox_id: str, namespace: str) -> None:
+        """Pause a BatchSandbox by patching spec.pause=true.
+
+        Validates that the current status.phase allows pause:
+        - Succeed: allowed (fresh pause)
+        - Succeed + PauseFailed=True: allowed (retry after failure, server internally patches nil->true)
+        - Pausing/Resuming: not allowed (operation in progress)
+        - Paused: not allowed (already paused)
+        - Failed: not allowed (sandbox unavailable)
+        - Failed + PauseFailed=True: not allowed (sandbox unavailable)
+        """
+        batchsandbox = self.get_workload(sandbox_id, namespace)
+        if not batchsandbox:
+            raise ValueError(f"Sandbox '{sandbox_id}' not found")
+
+        status = batchsandbox.get("status", {})
+        phase = status.get("phase", "")
+        conditions = status.get("conditions", [])
+
+        pause_failed = self._has_true_condition(conditions, "PauseFailed")
+
+        if phase == "Succeed":
+            pass
+        elif phase == "Pausing":
+            raise ValueError(f"Cannot pause: operation in progress (phase={phase})")
+        elif phase == "Resuming":
+            raise ValueError(f"Cannot pause: operation in progress (phase={phase})")
+        elif phase == "Paused":
+            raise ValueError("Sandbox is already paused")
+        elif phase == "Failed":
+            if pause_failed:
+                raise ValueError("Cannot pause: sandbox is not available (pause caused pod loss)")
+            else:
+                raise ValueError("Cannot pause: sandbox is not available")
+        elif phase == "Pending":
+            raise ValueError(f"Cannot pause: sandbox is being created (phase={phase})")
+        else:
+            raise ValueError(f"Cannot pause sandbox in phase {phase}")
+
+        if pause_failed:
+            self._patch_pause_with_retry_bridge(sandbox_id, namespace, True)
+            logger.info("Patched BatchSandbox %s retry bridge spec.pause=nil->true", sandbox_id)
+        else:
+            self.patch_workload(sandbox_id, namespace, {"spec": {"pause": True}})
+            logger.info("Patched BatchSandbox %s spec.pause=true", sandbox_id)
+
+    def resume_sandbox(self, sandbox_id: str, namespace: str) -> None:
+        """Resume a BatchSandbox by patching spec.pause=false.
+
+        Validates that the current status.phase allows resume:
+        - Paused: allowed (fresh resume)
+        - Paused + ResumeFailed=True: allowed (retry after failure, server internally patches nil->false)
+        - Resuming/Pausing: not allowed (operation in progress)
+        - Succeed: not allowed (not paused)
+        - Failed: not allowed (sandbox unavailable)
+        """
+        batchsandbox = self.get_workload(sandbox_id, namespace)
+        if not batchsandbox:
+            raise ValueError(f"Sandbox '{sandbox_id}' not found")
+
+        status = batchsandbox.get("status", {})
+        phase = status.get("phase", "")
+        conditions = status.get("conditions", [])
+
+        resume_failed = self._has_true_condition(conditions, "ResumeFailed")
+
+        # Allow resume when Paused (or Paused with ResumeFailed for retry)
+        if phase == "Paused":
+            # Always allowed, even if ResumeFailed=True (retry scenario)
+            pass
+        elif phase == "Resuming":
+            raise ValueError(f"Cannot resume: operation in progress (phase={phase})")
+        elif phase == "Pausing":
+            raise ValueError(f"Cannot resume: operation in progress (phase={phase})")
+        elif phase == "Succeed":
+            raise ValueError(f"Cannot resume sandbox in phase {phase}, expected Paused")
+        elif phase == "Failed":
+            if resume_failed:
+                raise ValueError("Cannot resume: sandbox is not available (resume caused pod start failure)")
+            else:
+                raise ValueError("Cannot resume: sandbox is not available")
+        elif phase == "Pending":
+            raise ValueError(f"Cannot resume: sandbox is being created (phase={phase})")
+        else:
+            raise ValueError(f"Cannot resume sandbox in phase {phase}, expected Paused")
+
+        if resume_failed:
+            self._patch_pause_with_retry_bridge(sandbox_id, namespace, False)
+            logger.info("Patched BatchSandbox %s retry bridge spec.pause=nil->false", sandbox_id)
+        else:
+            self.patch_workload(sandbox_id, namespace, {"spec": {"pause": False}})
+            logger.info("Patched BatchSandbox %s spec.pause=false", sandbox_id)
+
     def get_expiration(self, workload: Dict[str, Any]) -> Optional[datetime]:
         """Parse expiration timestamp from `spec.expireTime`."""
         spec = workload.get("spec", {})
@@ -502,7 +685,7 @@ class BatchSandboxProvider(WorkloadProvider):
         try:
             return datetime.fromisoformat(expire_time_str.replace('Z', '+00:00'))
         except (ValueError, TypeError) as e:
-            logger.warning("Invalid expireTime format: %s, error: %s", expire_time_str, e)
+            logger.warning(f"Invalid expireTime format: {expire_time_str}, error: {e}")
             return None
 
     def _parse_pod_ip(self, workload: Dict[str, Any]) -> Optional[str]:
@@ -554,11 +737,36 @@ class BatchSandboxProvider(WorkloadProvider):
     def get_status(self, workload: Dict[str, Any]) -> Dict[str, Any]:
         """Derive sandbox state from BatchSandbox status and pod readiness."""
         status = workload.get("status", {})
-        
+        creation_timestamp = workload.get("metadata", {}).get("creationTimestamp")
+
+        # Phase is authoritative when set (Pausing/Paused/Resuming/Failed)
+        phase = status.get("phase", "")
+        failed_message = self._first_true_condition_message(
+            status.get("conditions", []),
+            ["PodFailed", "ResumeFailed", "PauseFailed"],
+        )
+        phase_map = {
+            "Pending": ("Pending", "CREATING", "Sandbox is being created"),
+            "Succeed": ("Running", "RUNNING", "Sandbox is running"),
+            "Running": ("Running", "RUNNING", "Sandbox is running"),
+            "Pausing": ("Pausing", "PAUSING", "Pausing sandbox"),
+            "Paused": ("Paused", "PAUSED", "Sandbox is paused"),
+            "Resuming": ("Resuming", "RESUMING", "Resuming sandbox"),
+            "Failed": ("Failed", "FAILED", failed_message or "Operation failed"),
+        }
+        if phase in phase_map:
+            state, reason, message = phase_map[phase]
+            return {
+                "state": state,
+                "reason": reason,
+                "message": message,
+                "last_transition_at": creation_timestamp,
+            }
+
+        # Fallback: derive from pod state
         replicas = status.get("replicas", 0)
         ready = status.get("ready", 0)
         allocated = status.get("allocated", 0)
-
         pod_ip = self._parse_pod_ip(workload)
 
         if ready == 1 and pod_ip:
@@ -583,9 +791,7 @@ class BatchSandboxProvider(WorkloadProvider):
                     if allocated > 0
                     else "BatchSandbox is pending allocation"
                 )
-        
-        creation_timestamp = workload.get("metadata", {}).get("creationTimestamp")
-        
+
         return {
             "state": state,
             "reason": reason,
