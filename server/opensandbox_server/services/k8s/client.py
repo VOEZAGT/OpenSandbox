@@ -27,6 +27,7 @@ from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi, NodeV1A
 
 from opensandbox_server.config import KubernetesRuntimeConfig
 from opensandbox_server.services.k8s.informer import WorkloadInformer
+from opensandbox_server.services.k8s.label_selector import matches, parse_selector
 from opensandbox_server.services.k8s.rate_limiter import TokenBucketRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -183,7 +184,25 @@ class K8sClient:
         plural: str,
         label_selector: str = "",
     ) -> List[Dict[str, Any]]:
-        """List namespaced custom resources, returning the items list."""
+        """List namespaced custom resources, returning the items list.
+
+        Tries the informer cache first when available, synced, and the label
+        selector falls within the supported in-memory grammar. Falls back to
+        a direct API call (with rate limiting) otherwise.
+        """
+        informer = self._get_informer(group, version, plural, namespace)
+        if informer and informer.has_synced:
+            terms = parse_selector(label_selector)
+            if terms is not None:
+                cached = informer.list()
+                if not terms:
+                    return cached
+                return [
+                    obj
+                    for obj in cached
+                    if matches(obj.get("metadata", {}).get("labels") or {}, terms)
+                ]
+
         if self._read_limiter:
             self._read_limiter.acquire()
         try:

@@ -16,7 +16,7 @@
 
 import logging
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from kubernetes import watch
 from kubernetes.client import ApiException
@@ -84,6 +84,11 @@ class WorkloadInformer:
         """Return cached object by name, if present."""
         with self._lock:
             return self._cache.get(name)
+
+    def list(self) -> List[Dict[str, Any]]:
+        """Return a snapshot of every cached object."""
+        with self._lock:
+            return list(self._cache.values())
 
     def update_cache(self, obj: Dict[str, Any]) -> None:
         """Upsert a single object into the cache.

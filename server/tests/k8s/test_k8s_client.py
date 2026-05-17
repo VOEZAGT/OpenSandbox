@@ -233,6 +233,100 @@ class TestK8sClient:
         with pytest.raises(ApiException):
             c.list_custom_objects("g", "v1", "ns", "foos")
 
+    def _attach_synced_informer(self, c, items):
+        fake_informer = MagicMock()
+        fake_informer.has_synced = True
+        fake_informer.list.return_value = list(items)
+        c._informers[("g", "v1", "foos", "ns")] = fake_informer
+        c.config = MagicMock(
+            informer_enabled=True,
+            informer_resync_seconds=300,
+            informer_watch_timeout_seconds=60,
+            read_qps=0.0,
+            write_qps=0.0,
+        )
+        return fake_informer
+
+    def test_list_custom_objects_returns_cached_when_synced(self, k8s_runtime_config):
+        """When the informer is synced, list_custom_objects serves from cache."""
+        c = self._make_client(k8s_runtime_config)
+        items = [
+            {"metadata": {"name": "a", "labels": {"opensandbox.io/id": "a"}}},
+            {"metadata": {"name": "b", "labels": {"opensandbox.io/id": "b"}}},
+        ]
+        self._attach_synced_informer(c, items)
+        result = c.list_custom_objects("g", "v1", "ns", "foos")
+        assert result == items
+        c._custom_objects_api.list_namespaced_custom_object.assert_not_called()
+
+    def test_list_custom_objects_filters_cached_by_label_existence(
+        self, k8s_runtime_config
+    ):
+        """Bare-key selector filters cached items in memory without an API call."""
+        c = self._make_client(k8s_runtime_config)
+        items = [
+            {"metadata": {"name": "with-id", "labels": {"opensandbox.io/id": "x"}}},
+            {"metadata": {"name": "no-id", "labels": {"other": "y"}}},
+        ]
+        self._attach_synced_informer(c, items)
+        result = c.list_custom_objects(
+            "g", "v1", "ns", "foos", label_selector="opensandbox.io/id"
+        )
+        assert [obj["metadata"]["name"] for obj in result] == ["with-id"]
+        c._custom_objects_api.list_namespaced_custom_object.assert_not_called()
+
+    def test_list_custom_objects_filters_cached_by_equality(self, k8s_runtime_config):
+        """key=value selector filters cached items in memory without an API call."""
+        c = self._make_client(k8s_runtime_config)
+        items = [
+            {"metadata": {"name": "alpha", "labels": {"team": "infra"}}},
+            {"metadata": {"name": "beta", "labels": {"team": "data"}}},
+        ]
+        self._attach_synced_informer(c, items)
+        result = c.list_custom_objects(
+            "g", "v1", "ns", "foos", label_selector="team=infra"
+        )
+        assert [obj["metadata"]["name"] for obj in result] == ["alpha"]
+        c._custom_objects_api.list_namespaced_custom_object.assert_not_called()
+
+    def test_list_custom_objects_falls_back_when_informer_unsynced(
+        self, k8s_runtime_config
+    ):
+        """Cache miss when has_synced=False routes to direct API."""
+        c = self._make_client(k8s_runtime_config)
+        fake_informer = MagicMock()
+        fake_informer.has_synced = False
+        c._informers[("g", "v1", "foos", "ns")] = fake_informer
+        c.config = MagicMock(
+            informer_enabled=True,
+            informer_resync_seconds=300,
+            informer_watch_timeout_seconds=60,
+            read_qps=0.0,
+            write_qps=0.0,
+        )
+        c._custom_objects_api.list_namespaced_custom_object.return_value = {
+            "items": [{"metadata": {"name": "z"}}]
+        }
+        result = c.list_custom_objects("g", "v1", "ns", "foos")
+        assert [obj["metadata"]["name"] for obj in result] == ["z"]
+        fake_informer.list.assert_not_called()
+        c._custom_objects_api.list_namespaced_custom_object.assert_called_once()
+
+    def test_list_custom_objects_falls_back_on_unsupported_selector(
+        self, k8s_runtime_config
+    ):
+        """Set-based selectors (in/notin) bypass the cache parser and hit the API."""
+        c = self._make_client(k8s_runtime_config)
+        self._attach_synced_informer(c, [{"metadata": {"name": "x"}}])
+        c._custom_objects_api.list_namespaced_custom_object.return_value = {
+            "items": [{"metadata": {"name": "from-api"}}]
+        }
+        result = c.list_custom_objects(
+            "g", "v1", "ns", "foos", label_selector="env in (prod, staging)"
+        )
+        assert [obj["metadata"]["name"] for obj in result] == ["from-api"]
+        c._custom_objects_api.list_namespaced_custom_object.assert_called_once()
+
     def test_delete_custom_object_delegates_to_api(self, k8s_runtime_config):
         """delete_custom_object forwards arguments to the raw API."""
         c = self._make_client(k8s_runtime_config)
