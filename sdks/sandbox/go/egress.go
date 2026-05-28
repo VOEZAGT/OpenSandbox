@@ -22,6 +22,9 @@ type EgressClient struct {
 	*Client
 }
 
+// egressAuthHeader is the authentication header used by the Egress sidecar API.
+const egressAuthHeader = "OPENSANDBOX-EGRESS-AUTH"
+
 // NewEgressClient creates a new EgressClient.
 // baseURL is the sandbox-specific egress sidecar endpoint
 // (e.g. "http://localhost:18080").
@@ -29,7 +32,7 @@ type EgressClient struct {
 // if the sidecar does not require authentication.
 func NewEgressClient(baseURL, authToken string, opts ...Option) *EgressClient {
 	return &EgressClient{
-		Client: NewClient(baseURL, authToken, "OPENSANDBOX-EGRESS-AUTH", opts...),
+		Client: NewClient(baseURL, authToken, egressAuthHeader, opts...),
 	}
 }
 
@@ -48,6 +51,18 @@ func (c *EgressClient) GetPolicy(ctx context.Context) (*PolicyStatusResponse, er
 func (c *EgressClient) PatchPolicy(ctx context.Context, rules []NetworkRule) (*PolicyStatusResponse, error) {
 	var resp PolicyStatusResponse
 	if err := c.doRequest(ctx, "PATCH", "/policy", rules, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DeletePolicy removes egress rules matching the given targets from the current
+// policy. Each target is a FQDN or wildcard domain. Targets not present in the
+// policy are silently ignored (idempotent). The current defaultAction is
+// preserved.
+func (c *EgressClient) DeletePolicy(ctx context.Context, targets []string) (*PolicyStatusResponse, error) {
+	var resp PolicyStatusResponse
+	if err := c.doRequest(ctx, "DELETE", "/policy", targets, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

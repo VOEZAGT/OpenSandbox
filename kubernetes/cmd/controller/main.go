@@ -41,10 +41,17 @@ import (
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller"
+	poolassign "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/controller/poolassign"
 	cryptoutil "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/crypto"
+	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/expectations"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/fieldindex"
 	"github.com/alibaba/OpenSandbox/sandbox-k8s/internal/utils/logging"
 	// +kubebuilder:scaffold:imports
+)
+
+var (
+	commitID  = "unknown"
+	buildDate = "unknown"
 )
 
 const (
@@ -197,6 +204,9 @@ func main() {
 	var imageCommitterImage string
 	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations (contains nerdctl tool).")
 
+	var containerdSocketPath string
+	flag.StringVar(&containerdSocketPath, "containerd-socket-path", controller.ContainerdSocketPath, "Containerd socket path")
+
 	// Commit job timeout
 	var commitJobTimeout time.Duration
 	flag.DurationVar(&commitJobTimeout, "commit-job-timeout", 10*time.Minute, "The timeout duration for commit jobs.")
@@ -232,6 +242,8 @@ func main() {
 
 	logger := logging.NewLoggerWithZapOptions(logOpts)
 	ctrl.SetLogger(logger)
+
+	setupLog.Info("Starting controller", "commitID", commitID, "buildDate", buildDate)
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -371,11 +383,12 @@ func main() {
 	}
 
 	config := ctrl.GetConfigOrDie()
+	config.UserAgent = "sandbox-k8s-controller/1.0"
 	// Set client rate limiter if specified
-	if kubeClientQPS > 0 {
+	if kubeClientQPS != 0 {
 		config.QPS = float32(kubeClientQPS)
 	}
-	if kubeClientBurst > 0 {
+	if kubeClientBurst != 0 {
 		config.Burst = kubeClientBurst
 	}
 
@@ -410,11 +423,20 @@ func main() {
 	poolConcurrency := concurrencyConfig.Get(poolKindName, defaultPoolConcurrency)
 	setupLog.Info("controller concurrency configured", batchSandboxKindName, batchSandboxConcurrency, poolKindName, poolConcurrency)
 
+	profileStore := poolassign.NewProfileStore()
+	_ = profileStore.LoadDefault()
+	if err := profileStore.SetupWithManager(mgr, os.Getenv("POD_NAMESPACE")); err != nil {
+		setupLog.Error(err, "failed to setup pool assign profiles ConfigMap watch")
+		os.Exit(1)
+	}
+
 	if err := (&controller.BatchSandboxReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		Recorder:         mgr.GetEventRecorderFor("batchsandbox-controller"),
-		ResumePullSecret: resumePullSecret,
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		Recorder:            mgr.GetEventRecorderFor("batchsandbox-controller"),
+		ResumePullSecret:    resumePullSecret,
+		ProfileStore:        profileStore,
+		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
 	}).SetupWithManager(mgr, batchSandboxConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BatchSandbox")
 		os.Exit(1)
@@ -434,6 +456,7 @@ func main() {
 		Scheme:                   mgr.GetScheme(),
 		Recorder:                 mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
 		ImageCommitterImage:      imageCommitterImage,
+		ContainerdSocketPath:     containerdSocketPath,
 		CommitJobTimeout:         commitJobTimeout,
 		SnapshotRegistry:         snapshotRegistry,
 		SnapshotRegistryInsecure: snapshotRegistryInsecure,

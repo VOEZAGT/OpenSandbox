@@ -23,7 +23,8 @@ import requests
 
 
 # Configuration defaults - can be overridden via environment variables
-DEFAULT_SERVER = os.getenv("OPENCLAW_SERVER", "http://localhost:8080")
+DEFAULT_SERVER = os.getenv("OPEN_SANDBOX_SERVER", "http://localhost:8080")
+DEFAULT_API_KEY = os.getenv("OPEN_SANDBOX_API_KEY", "")
 DEFAULT_IMAGE = os.getenv("OPENCLAW_IMAGE", "ghcr.io/openclaw/openclaw:latest")
 DEFAULT_TIMEOUT = int(os.getenv("OPENCLAW_TIMEOUT", "3600"))
 DEFAULT_TOKEN = os.getenv("OPENCLAW_TOKEN", "dummy-token-for-sandbox")
@@ -64,12 +65,14 @@ def check_openclaw(sbx: SandboxSync, port: int = DEFAULT_PORT) -> bool:
 
 def main() -> None:
     server = DEFAULT_SERVER
+    api_key = DEFAULT_API_KEY
     image = DEFAULT_IMAGE
     timeout_seconds = DEFAULT_TIMEOUT
     token = os.getenv("OPENCLAW_GATEWAY_TOKEN", DEFAULT_TOKEN)
     port = DEFAULT_PORT
 
     print(f"Creating openclaw sandbox with image={image} on OpenSandbox server {server}...")
+    print(f"  API Key: {api_key[:16]}..." if len(api_key) > 16 else f"  API Key: {api_key}")
     print(f"  Token: {token[:16]}..." if len(token) > 16 else f"  Token: {token}")
     print(f"  Port: {port}")
     print(f"  Timeout: {timeout_seconds}s")
@@ -78,8 +81,8 @@ def main() -> None:
         image=image,
         timeout=timedelta(seconds=timeout_seconds),
         metadata={"example": "openclaw"},
-        entrypoint=[f"node dist/index.js gateway --bind=lan --port {port} --allow-unconfigured --verbose"],
-        connection_config=ConnectionConfigSync(domain=server),
+        entrypoint=["node", "dist/index.js", "gateway", "--bind=lan", "--port", str(port), "--allow-unconfigured", "--verbose"],
+        connection_config=ConnectionConfigSync(domain=server, api_key=api_key),
         health_check=lambda sbx: check_openclaw(sbx, port),
         # env for openclaw
         env={

@@ -444,6 +444,20 @@ public sealed class Sandbox : IAsyncDisposable
     }
 
     /// <summary>
+    /// Patches metadata for this sandbox.
+    /// </summary>
+    /// <param name="patch">Metadata merge patch. Non-null values add or replace keys; null values delete keys.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The current sandbox information after applying the patch.</returns>
+    /// <exception cref="SandboxApiException">Thrown when the sandbox API returns an error.</exception>
+    public Task<SandboxInfo> PatchMetadataAsync(
+        IReadOnlyDictionary<string, string?> patch,
+        CancellationToken cancellationToken = default)
+    {
+        return _sandboxes.PatchSandboxMetadataAsync(Id, patch, cancellationToken);
+    }
+
+    /// <summary>
     /// Checks if the sandbox is healthy.
     /// </summary>
     /// <param name="cancellationToken">Cancellation token.</param>
@@ -577,6 +591,23 @@ public sealed class Sandbox : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         await _egress.PatchRulesAsync(rules, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Deletes egress rules for this sandbox by target.
+    ///
+    /// Each entry is a FQDN or wildcard domain. Matching rules are removed
+    /// from the currently enforced policy. Targets not present in the policy
+    /// are silently ignored (idempotent). The current defaultAction is
+    /// preserved.
+    /// </summary>
+    /// <param name="targets">Target FQDNs or wildcard domains to remove.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task DeleteEgressRulesAsync(
+        IReadOnlyList<string> targets,
+        CancellationToken cancellationToken = default)
+    {
+        await _egress.DeleteRulesAsync(targets, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

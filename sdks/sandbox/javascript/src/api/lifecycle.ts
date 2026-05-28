@@ -242,7 +242,13 @@ export interface paths {
         post?: never;
         /**
          * Delete a snapshot
-         * @description Delete a persistent sandbox snapshot by id. Snapshots that are still being created cannot be deleted.
+         * @description Delete a persistent sandbox snapshot by id. Snapshots that are still
+         *     being created cannot be deleted.
+         *
+         *     For Kubernetes-backed snapshots, deletion removes OpenSandbox metadata
+         *     and Kubernetes coordination resources, but does not guarantee removal
+         *     of pushed OCI images from the configured registry. Use registry
+         *     retention or garbage collection policies for image lifecycle cleanup.
          */
         delete: {
             parameters: {
@@ -365,6 +371,85 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sandboxes/{sandboxId}/metadata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Unique sandbox identifier */
+                sandboxId: components["parameters"]["SandboxId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Patch sandbox metadata
+         * @description Update sandbox metadata using JSON Merge Patch semantics (RFC 7396).
+         *
+         *     **Merge Patch rules:**
+         *     | Request body key/value | Behavior |
+         *     |---|---|
+         *     | `"key": "value"` | Add or replace the key |
+         *     | `"key": null` | Delete the key (silently ignored if key does not exist) |
+         *     | key absent | Keep current value (no change) |
+         *     | Empty `{}` | No-op, returns current metadata |
+         *
+         *     Metadata keys and values must comply with Kubernetes label rules:
+         *     - Keys must be valid DNS label names or prefixed DNS subdomains
+         *     - Keys with the `opensandbox.io/` prefix are reserved and rejected
+         *     - Values must be 63 characters or less, matching `[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?`
+         *
+         *     This operation does not restart or recreate the sandbox container/pod.
+         *
+         *     **Concurrency:** This endpoint uses read-modify-write without optimistic
+         *     locking (no `resourceVersion` check). Concurrent PATCH requests may
+         *     interleave and silently drop updates. Use a single writer or coordinate
+         *     out-of-band when concurrent modifications to the same key are expected.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description Unique sandbox identifier */
+                    sandboxId: components["parameters"]["SandboxId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["PatchSandboxMetadataRequest"];
+                };
+            };
+            responses: {
+                /**
+                 * @description Metadata patched successfully. Returns the complete sandbox resource
+                 *     with updated metadata.
+                 */
+                200: {
+                    headers: {
+                        "X-Request-ID": components["headers"]["XRequestId"];
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Sandbox"];
+                    };
+                };
+                400: components["responses"]["BadRequest"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+                500: components["responses"]["InternalServerError"];
+            };
+        };
+        trace?: never;
+    };
     "/sandboxes/{sandboxId}/snapshots": {
         parameters: {
             query?: never;
@@ -377,8 +462,10 @@ export interface paths {
         /**
          * Create a snapshot from a sandbox
          * @description Create a persistent point-in-time snapshot from the sandbox's current state.
-         *     The returned snapshot id identifies the created artifact. Snapshot creation may
-         *     temporarily pause the sandbox while the runtime captures provider-supported state.
+         *     The source sandbox must be `Running`. The returned snapshot id identifies
+         *     the created artifact. Snapshot creation may temporarily pause the sandbox
+         *     while the runtime captures provider-supported state, then the source
+         *     sandbox continues running.
          */
         post: {
             parameters: {
@@ -901,6 +988,24 @@ export interface components {
              * @enum {string}
              */
             arch: "amd64" | "arm64";
+        };
+        /**
+         * @description JSON Merge Patch (RFC 7396) request body for updating sandbox metadata.
+         *
+         *     The request body is the metadata object itself:
+         *     - Present keys with non-null values add or replace
+         *     - Keys with `null` values are deleted
+         *     - Absent keys are left unchanged
+         *
+         *     Keys with the `opensandbox.io/` prefix are reserved and rejected.
+         * @example {
+         *       "project": "new-project",
+         *       "team": null,
+         *       "environment": "production"
+         *     }
+         */
+        PatchSandboxMetadataRequest: {
+            [key: string]: string | null;
         };
         /**
          * @description Request to create a new sandbox from either a container image or a snapshot.

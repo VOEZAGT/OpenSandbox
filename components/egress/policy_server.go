@@ -147,8 +147,10 @@ func (s *policyServer) handlePolicy(w http.ResponseWriter, r *http.Request) {
 		s.handlePost(w, r)
 	case http.MethodPatch:
 		s.handlePatch(w, r)
+	case http.MethodDelete:
+		s.handleDelete(w, r)
 	default:
-		w.Header().Set("Allow", "GET, POST, PUT, PATCH")
+		w.Header().Set("Allow", "GET, POST, PUT, PATCH, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
@@ -222,13 +224,14 @@ func (s *policyServer) handlePatch(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	raw, err := readPolicyRequestBody(r)
-	if err != nil || raw == "" {
-		if err != nil {
-			logEgressUpdateFailedWarn(fmt.Sprintf("failed to read body: %v", err))
-		} else {
-			logEgressUpdateFailedWarn("empty patch body")
-		}
+	if err != nil {
+		logEgressUpdateFailedWarn(fmt.Sprintf("failed to read body: %v", err))
 		http.Error(w, fmt.Sprintf("failed to read body: %v", err), http.StatusBadRequest)
+		return
+	}
+	if raw == "" {
+		logEgressUpdateFailedWarn("empty patch body")
+		http.Error(w, "empty body", http.StatusBadRequest)
 		return
 	}
 
@@ -268,6 +271,84 @@ func (s *policyServer) handlePatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *policyServer) handleDelete(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	raw, err := readPolicyRequestBody(r)
+	if err != nil {
+		logEgressUpdateFailedWarn(fmt.Sprintf("failed to read body: %v", err))
+		http.Error(w, fmt.Sprintf("failed to read body: %v", err), http.StatusBadRequest)
+		return
+	}
+	if raw == "" {
+		logEgressUpdateFailedWarn("empty delete body")
+		http.Error(w, "empty body", http.StatusBadRequest)
+		return
+	}
+
+	var targets []string
+	if err := json.Unmarshal([]byte(raw), &targets); err != nil {
+		logEgressUpdateFailedWarn(fmt.Sprintf("invalid delete targets: %v", err))
+		http.Error(w, fmt.Sprintf("invalid delete targets: %v", err), http.StatusBadRequest)
+		return
+	}
+	if len(targets) == 0 {
+		logEgressUpdateFailedWarn("empty delete targets array")
+		http.Error(w, "invalid delete targets: empty array", http.StatusBadRequest)
+		return
+	}
+
+	base := s.proxy.CurrentPolicy()
+	if base == nil {
+		base = policy.DefaultDenyPolicy()
+	}
+	oldCount := len(base.Egress)
+	newEgress, removedRules := removeRulesByTarget(base.Egress, targets)
+	removed := oldCount - len(newEgress)
+
+	if removed == 0 {
+		mode := modeFromPolicy(base)
+		writeJSON(w, http.StatusOK, policyStatusResponse{
+			Status:          "ok",
+			Mode:            mode,
+			EnforcementMode: s.enforcementMode,
+			Reason:          "no matching targets found",
+		})
+		return
+	}
+
+	rawMerged, err := json.Marshal(policy.NetworkPolicy{
+		DefaultAction: base.DefaultAction,
+		Egress:        newEgress,
+	})
+	if err != nil {
+		logEgressUpdateFailedError(fmt.Sprintf("failed to marshal updated policy: %v", err))
+		http.Error(w, fmt.Sprintf("internal error: %v", err), http.StatusInternalServerError)
+		return
+	}
+	newPolicy, err := policy.ParsePolicy(string(rawMerged))
+	if err != nil {
+		logEgressUpdateFailedError(fmt.Sprintf("invalid policy after delete: %v", err))
+		http.Error(w, fmt.Sprintf("internal error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	mode := modeFromPolicy(newPolicy)
+	log.Infof("policy API: deleting %d egress rule(s) by target, removed=%d, mode=%s, enforcement=%s", len(targets), removed, mode, s.enforcementMode)
+	if !s.commitPolicy(r.Context(), w, newPolicy, "delete") {
+		return
+	}
+	logEgressUpdated(newPolicy.DefaultAction, removedRules)
+	log.Infof("policy API: delete applied successfully")
+	writeJSON(w, http.StatusOK, policyStatusResponse{
+		Status:          "ok",
+		Mode:            mode,
+		EnforcementMode: s.enforcementMode,
+	})
+}
+
 // commitPolicy applies one logical change: optional disk persist → merge always file rules → nft
 // static (with nameserver allow-IPs) → then update in-memory user policy (POST/PATCH/GET view).
 func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, pol *policy.NetworkPolicy, op string) bool {
@@ -280,7 +361,9 @@ func (s *policyServer) commitPolicy(ctx context.Context, w http.ResponseWriter, 
 	alwaysDeny, alwaysAllow := s.currentAlwaysRules()
 	merged := policy.MergeAlwaysOverlay(pol, alwaysDeny, alwaysAllow)
 	if s.nft != nil {
-		if err := s.nft.ApplyStatic(ctx, merged.WithExtraAllowIPs(s.nameserverIPs)); err != nil {
+		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer nftCancel()
+		if err := s.nft.ApplyStatic(nftCtx, merged.WithExtraAllowIPs(s.nameserverIPs)); err != nil {
 			logEgressUpdateFailedError(fmt.Sprintf("nftables apply (%s): %v", op, err))
 			log.Errorf("policy API: nftables apply failed (%s): %v", op, err)
 			http.Error(w, fmt.Sprintf("failed to apply nftables policy: %v", err), http.StatusInternalServerError)

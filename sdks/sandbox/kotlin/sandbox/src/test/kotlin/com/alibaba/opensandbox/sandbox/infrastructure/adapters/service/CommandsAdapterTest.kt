@@ -25,6 +25,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.ExecutionH
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunInSessionRequest
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
+import com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter.toCommandTimeoutMillis
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
@@ -39,9 +40,9 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
+import java.time.Duration
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.time.Duration.Companion.seconds
 
 class CommandsAdapterTest {
     // CommandsAdapter unit tests
@@ -340,7 +341,7 @@ data: {"type":"execution_complete","execution_time":100,"timestamp":167253120100
                 RunInSessionRequest.builder()
                     .command("echo Hello")
                     .workingDirectory("/workspace")
-                    .timeout(5.seconds)
+                    .timeout(Duration.ofSeconds(5))
                     .handlers(handlers)
                     .build(),
             )
@@ -357,6 +358,15 @@ data: {"type":"execution_complete","execution_time":100,"timestamp":167253120100
         assertEquals("echo Hello", requestBodyJson["command"]?.jsonPrimitive?.content)
         assertEquals("/workspace", requestBodyJson["cwd"]?.jsonPrimitive?.content)
         assertEquals(5000L, requestBodyJson["timeout"]?.jsonPrimitive?.content?.toLong())
+    }
+
+    @Test
+    fun `command timeout conversion should reject durations too large for milliseconds`() {
+        val exception =
+            assertThrows(IllegalArgumentException::class.java) {
+                Duration.ofSeconds(Long.MAX_VALUE).toCommandTimeoutMillis()
+            }
+        assertTrue(exception.message!!.contains("too large to represent in milliseconds"))
     }
 
     @Test

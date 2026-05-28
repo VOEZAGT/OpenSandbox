@@ -21,7 +21,8 @@ import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.CommandSta
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.Execution
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunCommandRequest
 import com.alibaba.opensandbox.sandbox.domain.models.execd.executions.RunInSessionRequest
-import kotlin.time.Duration
+import java.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * Command execution operations for sandbox environments.
@@ -115,14 +116,31 @@ interface Commands {
         workingDirectory: String? = null,
         timeout: Duration? = null,
     ): Execution {
-        return runInSession(
-            sessionId,
+        val builder =
             RunInSessionRequest.builder()
                 .command(command)
                 .workingDirectory(workingDirectory)
-                .timeout(timeout)
-                .build(),
-        )
+        if (timeout != null) {
+            builder.timeout(timeout)
+        }
+        return runInSession(sessionId, builder.build())
+    }
+
+    @Deprecated(
+        message = "Use java.time.Duration instead.",
+        replaceWith =
+            ReplaceWith(
+                "runInSession(sessionId, command, workingDirectory, timeout.toJavaDuration())",
+                "kotlin.time.toJavaDuration",
+            ),
+    )
+    fun runInSession(
+        sessionId: String,
+        command: String,
+        workingDirectory: String? = null,
+        timeout: kotlin.time.Duration,
+    ): Execution {
+        return runInSession(sessionId, command, workingDirectory, timeout.toJavaDuration())
     }
 
     /**

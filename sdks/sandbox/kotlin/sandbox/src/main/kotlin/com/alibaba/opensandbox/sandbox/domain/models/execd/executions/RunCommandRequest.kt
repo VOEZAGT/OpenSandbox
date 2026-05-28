@@ -16,7 +16,8 @@
 
 package com.alibaba.opensandbox.sandbox.domain.models.execd.executions
 
-import kotlin.time.Duration
+import java.time.Duration
+import kotlin.time.toJavaDuration
 
 /**
  * Parameters for command execution.
@@ -75,9 +76,17 @@ class RunCommandRequest private constructor(
          * Maximum execution time; server will terminate the command when reached.
          * If omitted, the server will not enforce any timeout.
          */
-        fun timeout(timeout: Duration?): Builder {
+        fun timeout(timeout: Duration): Builder {
             this.timeout = timeout
             return this
+        }
+
+        @Deprecated(
+            message = "Use java.time.Duration instead.",
+            replaceWith = ReplaceWith("timeout(timeout.toJavaDuration())", "kotlin.time.toJavaDuration"),
+        )
+        fun timeout(timeout: kotlin.time.Duration): Builder {
+            return timeout(timeout.toJavaDuration())
         }
 
         fun uid(uid: Int?): Builder {

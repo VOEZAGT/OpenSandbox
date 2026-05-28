@@ -164,7 +164,7 @@ The chart exposes the snapshot-related settings below:
 ```yaml
 controller:
   snapshot:
-    imageCommitterImage: my-registry/image-committer:v1.0.0
+    imageCommitterImage: my-registry/image-committer:v0.1.0
     commitJobTimeout: 15m
     registry: my-registry/snapshots
     registryInsecure: false

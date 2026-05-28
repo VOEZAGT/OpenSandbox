@@ -4,6 +4,13 @@ permissions:
   contents: read
 
 on:
+  workflow_dispatch:
+    inputs:
+      run_code_interpreter_e2e:
+        description: 'Run code-interpreter E2E tests'
+        required: false
+        type: boolean
+        default: false
   pull_request:
     branches: [ main ]
     paths:
@@ -25,6 +32,7 @@ jobs:
     runs-on: self-hosted
     env:
       UV_BIN: /home/admin/.local/bin
+      RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -39,12 +47,28 @@ jobs:
       - name: Clean up previous E2E resources
         run: |
           docker ps -aq --filter "label=opensandbox" | xargs -r docker rm -f || true
+          docker rm -f opensandbox-e2e-redis || true
           # Remove root-owned files from previous sandbox runs by mounting parent dir
           docker run --rm -v /tmp:/host_tmp alpine rm -rf /host_tmp/opensandbox-e2e || true
           docker image prune -f || true
 
       - name: Build local egress image
         run: docker build -t opensandbox/egress:local -f components/egress/Dockerfile .
+
+      - name: Start Redis for Python pool E2E
+        run: |
+          docker rm -f opensandbox-e2e-redis || true
+          docker run -d --name opensandbox-e2e-redis -p 127.0.0.1::6379 redis:7-alpine
+          REDIS_PORT="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6379/tcp") 0).HostPort}}' opensandbox-e2e-redis)"
+          echo "OPENSANDBOX_TEST_REDIS_URL=redis://127.0.0.1:${REDIS_PORT}/0" >> "$GITHUB_ENV"
+          for i in {1..30}; do
+            if docker exec opensandbox-e2e-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs opensandbox-e2e-redis
+          exit 1
 
       - name: Run tests
         run: |
@@ -91,6 +115,7 @@ jobs:
         if: always()
         run: |
           docker ps -aq --filter "label=opensandbox" | xargs -r docker rm -f || true
+          docker rm -f opensandbox-e2e-redis || true
           docker run --rm -v /tmp:/host_tmp alpine rm -rf /host_tmp/opensandbox-e2e || true
           pkill -f "python -m opensandbox_server.main" || true
 
@@ -99,6 +124,7 @@ jobs:
     runs-on: self-hosted
     env:
       UV_BIN: /home/admin/.local/bin
+      RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -125,11 +151,27 @@ jobs:
       - name: Clean up previous E2E resources
         run: |
           docker ps -aq --filter "label=opensandbox" | xargs -r docker rm -f || true
+          docker rm -f opensandbox-e2e-redis || true
           docker run --rm -v /tmp:/host_tmp alpine rm -rf /host_tmp/opensandbox-e2e || true
           docker image prune -f || true
 
       - name: Build local egress image
         run: docker build -t opensandbox/egress:local -f components/egress/Dockerfile .
+
+      - name: Start Redis for Java pool E2E
+        run: |
+          docker rm -f opensandbox-e2e-redis || true
+          docker run -d --name opensandbox-e2e-redis -p 127.0.0.1::6379 redis:7-alpine
+          REDIS_PORT="$(docker inspect -f '{{(index (index .NetworkSettings.Ports "6379/tcp") 0).HostPort}}' opensandbox-e2e-redis)"
+          echo "OPENSANDBOX_TEST_REDIS_URL=redis://127.0.0.1:${REDIS_PORT}/0" >> "$GITHUB_ENV"
+          for i in {1..30}; do
+            if docker exec opensandbox-e2e-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs opensandbox-e2e-redis
+          exit 1
 
       - name: Run tests
         env:
@@ -185,6 +227,7 @@ jobs:
         if: always()
         run: |
           docker ps -aq --filter "label=opensandbox" | xargs -r docker rm -f || true
+          docker rm -f opensandbox-e2e-redis || true
           docker run --rm -v /tmp:/host_tmp alpine rm -rf /host_tmp/opensandbox-e2e || true
           pkill -f "python -m opensandbox_server.main" || true
 
@@ -194,6 +237,7 @@ jobs:
     env:
       UV_BIN: /home/admin/.local/bin
       NODE_VERSION: "20.19.0"
+      RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -287,6 +331,7 @@ jobs:
     runs-on: self-hosted
     env:
       UV_BIN: /home/admin/.local/bin
+      RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -373,6 +418,7 @@ jobs:
       HOME: /home/admin/actions-runner
       GOCACHE: /home/admin/actions-runner/_temp/go-build
       GOMODCACHE: /home/admin/actions-runner/_temp/go-mod-cache
+      RUN_CODE_INTERPRETER_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.run_code_interpreter_e2e == true && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v6

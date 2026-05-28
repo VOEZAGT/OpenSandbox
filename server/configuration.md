@@ -10,10 +10,10 @@ Example files in this repository:
 
 | File | Purpose |
 |------|---------|
-| [`example.config.toml`](example.config.toml) | Docker runtime (English) |
-| [`example.config.zh.toml`](example.config.zh.toml) | Docker runtime (中文) |
-| [`example.config.k8s.toml`](example.config.k8s.toml) | Kubernetes runtime (English) |
-| [`example.config.k8s.zh.toml`](example.config.k8s.zh.toml) | Kubernetes runtime (中文) |
+| [`example.config.toml`](opensandbox_server/examples/example.config.toml) | Docker runtime (English) |
+| [`example.config.zh.toml`](opensandbox_server/examples/example.config.zh.toml) | Docker runtime (中文) |
+| [`example.config.k8s.toml`](opensandbox_server/examples/example.config.k8s.toml) | Kubernetes runtime (English) |
+| [`example.config.k8s.zh.toml`](opensandbox_server/examples/example.config.k8s.zh.toml) | Kubernetes runtime (中文) |
 
 ---
 
@@ -66,6 +66,11 @@ Example files in this repository:
 | `eip` | string \| omitted | `null` | Public IP or hostname used as the **host part** when the server returns sandbox endpoint URLs (notably Docker runtime). |
 | `max_sandbox_timeout_seconds` | integer \| omitted | `null` | Upper bound on sandbox TTL in seconds for **create** requests that specify `timeout`. Must be ≥ **60** if set. Omit to disable the server-side cap. |
 | `timeout_keep_alive` | integer | `30` | Idle keep-alive timeout (seconds) passed to uvicorn. |
+| `limit_concurrency` | integer | `1024` | Maximum concurrent connections before returning 503. Provides backpressure protection under burst load. Set to `0` to disable the cap (TOML cannot express `null`). |
+| `backlog` | integer | `2048` | Socket listen backlog passed to uvicorn. |
+| `thread_pool_size` | integer | `200` | Maximum size of the anyio default threadpool used by FastAPI to run sync route handlers. The anyio default of 40 throttles bursts of blocking sandbox list/get/delete operations under high concurrency. |
+| `loop` | `"auto"` \| `"uvloop"` \| `"asyncio"` | `"auto"` | Event loop implementation. `auto` prefers uvloop and falls back to asyncio. |
+| `http` | `"auto"` \| `"httptools"` \| `"h11"` | `"auto"` | HTTP protocol parser. `auto` prefers httptools and falls back to h11. |
 
 ---
 
@@ -120,6 +125,7 @@ If `runtime.type = "kubernetes"` and the `[kubernetes]` table is absent, the ser
 | `image_pull_policy` | string \| omitted | `"IfNotPresent"` | Image pull policy for the BatchSandbox main container. Values: **`Always`**, **`IfNotPresent`**, **`Never`**. |
 | `sandbox_create_timeout_seconds` | integer | `60` | Max time to wait for a new sandbox to become ready (e.g. IP assigned), in seconds. |
 | `sandbox_create_poll_interval_seconds` | float | `1.0` | Poll interval while waiting for readiness. |
+| `snapshot_create_timeout_seconds` | integer | `900` | Max time to wait for a Kubernetes public snapshot to become ready, in seconds. Set this greater than the controller snapshot `commitJobTimeout` / `--commit-job-timeout`. |
 | `informer_enabled` | boolean | `true` | **[Beta]** Use informer/watch cache for reads to reduce API load. |
 | `informer_resync_seconds` | integer | `300` | **[Beta]** Full resync period for the informer cache. |
 | `informer_watch_timeout_seconds` | integer | `60` | **[Beta]** Watch stream restart interval. |
