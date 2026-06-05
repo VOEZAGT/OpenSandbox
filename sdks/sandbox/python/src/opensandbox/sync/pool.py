@@ -76,6 +76,7 @@ class SandboxPoolSync:
         warmup_skip_health_check: bool = False,
         idle_timeout: timedelta = timedelta(hours=24),
         drain_timeout: timedelta = timedelta(seconds=30),
+        acquire_min_remaining_ttl: timedelta = timedelta(seconds=60),
         sandbox_manager_factory: Callable[
             [ConnectionConfigSync], SandboxManagerSync
         ] = SandboxManagerSync.create,
@@ -103,6 +104,7 @@ class SandboxPoolSync:
             warmup_skip_health_check=warmup_skip_health_check,
             idle_timeout=idle_timeout,
             drain_timeout=drain_timeout,
+            acquire_min_remaining_ttl=acquire_min_remaining_ttl,
         )
         self._state_store = self._config.state_store
         self._connection_config = connection_config

@@ -100,3 +100,43 @@ def test_zero_acquire_min_remaining_ttl_opts_out() -> None:
         acquire_min_remaining_ttl=timedelta(0),
     )
     assert config.acquire_min_remaining_ttl == timedelta(0)
+
+
+def test_sync_pool_facade_forwards_acquire_min_remaining_ttl() -> None:
+    """``SandboxPoolSync.__init__`` exposes the new threshold and forwards it to the config.
+
+    Without the constructor kwarg, users with ``idle_timeout <= 60s`` hit the hidden
+    default and get a hard validation error with no way to override.
+    """
+    from opensandbox.sync.pool import SandboxPoolSync
+
+    pool = SandboxPoolSync(
+        pool_name="test",
+        max_idle=1,
+        state_store=InMemoryPoolStateStore(),
+        connection_config=ConnectionConfigSync(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        idle_timeout=timedelta(seconds=30),
+        acquire_min_remaining_ttl=timedelta(seconds=10),
+    )
+
+    assert pool._config.acquire_min_remaining_ttl == timedelta(seconds=10)
+    assert pool._config.idle_timeout == timedelta(seconds=30)
+
+
+def test_async_pool_facade_forwards_acquire_min_remaining_ttl() -> None:
+    """``SandboxPoolAsync.__init__`` exposes the new threshold and forwards it to the config."""
+    from opensandbox.pool_async import SandboxPoolAsync
+
+    pool = SandboxPoolAsync(
+        pool_name="test",
+        max_idle=1,
+        state_store=InMemoryAsyncPoolStateStore(),
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        idle_timeout=timedelta(seconds=30),
+        acquire_min_remaining_ttl=timedelta(seconds=10),
+    )
+
+    assert pool._config.acquire_min_remaining_ttl == timedelta(seconds=10)
+    assert pool._config.idle_timeout == timedelta(seconds=30)
