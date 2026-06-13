@@ -16,6 +16,9 @@
 
 package com.alibaba.opensandbox.sandbox
 
+import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SnapshotFailedException
 import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSandboxInfos
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PaginationInfo
@@ -25,6 +28,9 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxState
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxStatus
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotState
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotStatus
 import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Sandboxes
 import io.mockk.Runs
@@ -36,6 +42,7 @@ import io.mockk.mockk
 import io.mockk.verify
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.extension.ExtendWith
@@ -189,5 +196,56 @@ class SandboxManagerTest {
         sandboxManager.close()
 
         verify { httpClientProvider.close() }
+    }
+
+    private fun snapshot(state: String): SnapshotInfo =
+        SnapshotInfo(
+            id = "snapshot-id",
+            sandboxId = "sandbox-id",
+            name = "snap",
+            status = SnapshotStatus(state = state, reason = null, message = null, lastTransitionAt = null),
+            createdAt = OffsetDateTime.now(),
+        )
+
+    @Test
+    fun `waitForSnapshotReady returns once the snapshot becomes ready`() {
+        val sequence = listOf(snapshot(SnapshotState.CREATING), snapshot(SnapshotState.READY))
+        var index = 0
+        every { sandboxService.getSnapshot("snapshot-id") } answers { sequence[index++] }
+
+        val result =
+            sandboxManager.waitForSnapshotReady(
+                "snapshot-id",
+                Duration.ofSeconds(5),
+                Duration.ofMillis(10),
+            )
+
+        assertEquals(SnapshotState.READY, result.status.state)
+        verify(exactly = 2) { sandboxService.getSnapshot("snapshot-id") }
+    }
+
+    @Test
+    fun `waitForSnapshotReady throws SnapshotFailedException when the snapshot fails`() {
+        every { sandboxService.getSnapshot("snapshot-id") } returns snapshot(SnapshotState.FAILED)
+
+        assertThrows(SnapshotFailedException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofSeconds(5), Duration.ofMillis(10))
+        }
+    }
+
+    @Test
+    fun `waitForSnapshotReady throws SandboxReadyTimeoutException when it never becomes ready`() {
+        every { sandboxService.getSnapshot("snapshot-id") } returns snapshot(SnapshotState.CREATING)
+
+        assertThrows(SandboxReadyTimeoutException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofMillis(30), Duration.ofMillis(10))
+        }
+    }
+
+    @Test
+    fun `waitForSnapshotReady rejects a non-positive polling interval`() {
+        assertThrows(InvalidArgumentException::class.java) {
+            sandboxManager.waitForSnapshotReady("snapshot-id", Duration.ofSeconds(5), Duration.ZERO)
+        }
     }
 }

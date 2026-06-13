@@ -19,6 +19,8 @@ package com.alibaba.opensandbox.sandbox
 import com.alibaba.opensandbox.sandbox.config.ConnectionConfig
 import com.alibaba.opensandbox.sandbox.domain.exceptions.InvalidArgumentException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxReadyTimeoutException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SnapshotFailedException
 import com.alibaba.opensandbox.sandbox.domain.models.diagnostics.DiagnosticContent
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSandboxInfos
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSnapshotInfos
@@ -27,6 +29,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxRenewResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotFilter
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotInfo
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SnapshotState
 import com.alibaba.opensandbox.sandbox.domain.services.Diagnostics
 import com.alibaba.opensandbox.sandbox.domain.services.Sandboxes
 import com.alibaba.opensandbox.sandbox.infrastructure.factory.AdapterFactory
@@ -223,6 +226,64 @@ class SandboxManager internal constructor(
     fun listSnapshots(filter: SnapshotFilter): PagedSnapshotInfos = sandboxService.listSnapshots(filter)
 
     fun deleteSnapshot(snapshotId: String) = sandboxService.deleteSnapshot(snapshotId)
+
+    /**
+     * Waits for a snapshot to reach the [SnapshotState.READY] state, polling at a fixed interval.
+     *
+     * Snapshot creation is asynchronous: [createSnapshot] returns as soon as the snapshot record
+     * exists (typically in the [SnapshotState.CREATING] state). This helper polls [getSnapshot]
+     * until the snapshot becomes ready, fails, or the timeout elapses.
+     *
+     * @param snapshotId Unique identifier of the snapshot to wait for
+     * @param timeout Maximum time to wait for the snapshot to become ready
+     * @param pollingInterval Time between successive [getSnapshot] polls
+     * @return The ready [SnapshotInfo]
+     * @throws SnapshotFailedException if the snapshot reaches the [SnapshotState.FAILED] state
+     * @throws SandboxReadyTimeoutException if the snapshot is not ready within [timeout]
+     * @throws InvalidArgumentException if [pollingInterval] is not positive
+     */
+    @JvmOverloads
+    fun waitForSnapshotReady(
+        snapshotId: String,
+        timeout: Duration = Duration.ofMinutes(5),
+        pollingInterval: Duration = Duration.ofSeconds(2),
+    ): SnapshotInfo {
+        if (pollingInterval.isNegative || pollingInterval.isZero) {
+            throw InvalidArgumentException("Polling interval must be positive, got: $pollingInterval")
+        }
+        logger.info("Waiting for snapshot {} to become ready (timeout: {}s)", snapshotId, timeout.seconds)
+
+        val deadline = System.currentTimeMillis() + timeout.toMillis()
+        var attempt = 0
+        while (true) {
+            attempt++
+            val snapshot = getSnapshot(snapshotId)
+            when (snapshot.status.state) {
+                SnapshotState.READY -> {
+                    logger.info("Snapshot {} is ready after {} attempts", snapshotId, attempt)
+                    return snapshot
+                }
+                SnapshotState.FAILED -> {
+                    val detail = snapshot.status.message ?: snapshot.status.reason ?: "no detail provided"
+                    throw SnapshotFailedException("Snapshot $snapshotId failed: $detail")
+                }
+                else ->
+                    logger.debug(
+                        "Snapshot {} not ready yet (state: {}, attempt #{})",
+                        snapshotId,
+                        snapshot.status.state,
+                        attempt,
+                    )
+            }
+
+            if (System.currentTimeMillis() + pollingInterval.toMillis() >= deadline) {
+                throw SandboxReadyTimeoutException(
+                    "Snapshot $snapshotId did not become ready within ${timeout.seconds}s ($attempt attempts)",
+                )
+            }
+            Thread.sleep(pollingInterval.toMillis())
+        }
+    }
 
     /**
      * Closes this resource, relinquishing any underlying resources.
