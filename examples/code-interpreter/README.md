@@ -104,7 +104,7 @@ spec:
             - name: opensandbox-bin
               mountPath: /opt/opensandbox/bin
         - name: execd-installer
-          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.18
+          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.19
           command: [ "/bin/sh", "-c" ]
           args:
             - |
