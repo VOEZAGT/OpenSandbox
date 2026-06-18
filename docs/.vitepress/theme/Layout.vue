@@ -37,6 +37,10 @@ function resolveLegacy(rawPath: string): string {
   if (p === "" || p === "/") return "/";
   if (EXACT[p]) return EXACT[p];
   if (p.startsWith("/oseps/")) return "/community/oseps";
+  // Collapse any nested legacy SDK route (incl. the old /sdks/sandbox/* and
+  // /sdks/mcp/* variants) to its top-level page, e.g. /sdks/kotlin, /sdks/mcp.
+  const sdk = p.match(/^\/sdks\/(?:sandbox\/)?([^/]+)\//);
+  if (sdk) return `/sdks/${sdk[1]}`;
   p = p.replace("/sdks/sandbox/", "/sdks/").replace(/\/(readme|development)$/, "");
   return p || "/";
 }
