@@ -123,17 +123,6 @@ def _http_get(base_url: str, path: str, headers: dict) -> requests.Response:
     return resp
 
 
-def _wait_state(sandbox, target_state: str, attempts: int = 300) -> bool:
-    for _ in range(attempts):
-        try:
-            if sandbox.get_info().status.state == target_state:
-                return True
-        except Exception:
-            pass
-        time.sleep(1)
-    return False
-
-
 def _wait_sandbox_ready(sandbox, timeout_seconds: int = 300) -> None:
     start = time.time()
     while time.time() - start < timeout_seconds:
@@ -287,7 +276,7 @@ def step_llm(sandbox_id: str, question: str | None = None) -> None:
     )
     chat_payload = json.dumps({
         "messages": [{"role": "user", "content": prompt}],
-        "max_completion_tokens": 256,
+        "max_tokens": 256,
     })
     # The `api-key` header is intentionally NOT set here: Credential Vault
     # injects the real key at the egress sidecar, so the command stays
@@ -303,7 +292,9 @@ def step_llm(sandbox_id: str, question: str | None = None) -> None:
 
     # Parse and print just the answer if possible
     if exec_result.exit_code == 0 and exec_result.logs.stdout:
-        raw = exec_result.logs.stdout[0].text
+        # Command output can be split across multiple log messages, so join
+        # them all before parsing the JSON response.
+        raw = "".join(msg.text for msg in exec_result.logs.stdout)
         try:
             resp = json.loads(raw)
             answer = resp["choices"][0]["message"]["content"]
@@ -379,6 +370,8 @@ def step_exec(sandbox_id: str, command: str | None = None) -> None:
 
     # Full demo
     base_url, headers = _ingress(sandbox)
+    if not _wait_http_ready(base_url, headers):
+        raise RuntimeError("Sandbox HTTP server did not become reachable.")
 
     sandbox.commands.run(f"echo 'generated in sandbox' > {HTTP_ROOT}/exec.txt")
     _http_get(base_url, "/exec.txt", headers)
@@ -395,14 +388,29 @@ def step_pause(sandbox_id: str) -> None:
     print("[lifecycle] pausing sandbox...")
     sandbox.pause()
 
-    if _wait_state(sandbox, SandboxState.PAUSED):
-        print("[lifecycle] sandbox is PAUSED")
-    else:
-        print("[lifecycle] pause requested (state not confirmed PAUSED)")
+    # Poll for PAUSED, but abort as soon as the controller reports FAILED
+    # (e.g. missing controller.snapshot.registry or a bad push secret) so the
+    # failure surfaces instead of silently exiting 0 after the timeout.
+    for _ in range(300):
+        try:
+            info = sandbox.get_info()
+        except Exception:
+            time.sleep(1)
+            continue
+        state = info.status.state
+        if state == SandboxState.PAUSED:
+            print("[lifecycle] sandbox is PAUSED")
+            return
+        if state == SandboxState.FAILED:
+            message = info.status.message or "no detail provided"
+            raise RuntimeError(f"Pause failed: {message}")
+        time.sleep(1)
+
+    print("[lifecycle] pause requested (state not confirmed PAUSED)")
 
 
 def step_resume(sandbox_id: str) -> str:
-    """Resume a paused sandbox and return its (possibly new) ID."""
+    """Resume a paused sandbox and return its ID (stable across pause/resume)."""
     print("[lifecycle] resuming sandbox...")
     resumed = SandboxSync.resume(
         sandbox_id,

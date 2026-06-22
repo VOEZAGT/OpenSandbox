@@ -1,3 +1,11 @@
+# ⚠️  DEMO VALUES — NOT FOR PRODUCTION
+# This file uses insecure, well-known demo credentials so the local
+# port-forward walkthrough works out of the box:
+#   - configToml [server].api_key = "aks-kata-demo-key"
+#   - server.gateway.secureAccess.keys[0].key (a fixed base64 signing key)
+# Replace BOTH with unique secret values (e.g. a random api_key and
+# `openssl rand -base64 32` for the signing key) before exposing the server or
+# ingress gateway to anything other than 127.0.0.1.
 server:
   replicaCount: 1
   gateway:
