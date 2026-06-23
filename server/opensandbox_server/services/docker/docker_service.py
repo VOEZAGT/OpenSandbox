@@ -39,6 +39,8 @@ from fastapi import HTTPException, status
 
 from opensandbox_server.extensions import (
     ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY,
+    BOOTSTRAP_EXECD_ISOLATION_KEY,
+    ISOLATION_UPPER_MOUNT_PATH,
 )
 from opensandbox_server.api.schema import (
     CreateSandboxRequest,
@@ -159,6 +161,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
         self.network_mode = (self.app_config.docker.network_mode or HOST_NETWORK_MODE).lower()
         self._execd_archive_cache: Dict[str, bytes] = {}
         self._bootstrap_script_cache: Dict[str, bytes] = {}
+        self._bwrap_archive_cache: Dict[str, bytes] = {}
         self._windows_profile_cache: Dict[str, bytes] = {}
         self._daemon_platform: Optional[PlatformSpec] = None
         self._metadata_store = DockerMetadataStore()
@@ -966,6 +969,26 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                     (request.resource_limits.root if request.resource_limits else None) or {},
                 )
                 environment = inject_windows_user_ports(environment, exposed_ports)
+
+            # Inject CAP_SYS_ADMIN + unconfined AppArmor when bwrap isolation is requested.
+            # bwrap needs pivot_root/mount which require CAP_SYS_ADMIN and are blocked
+            # by Docker's default AppArmor profile.
+            if (request.extensions or {}).get(BOOTSTRAP_EXECD_ISOLATION_KEY) == "enable":
+                cap_add = set(host_config_kwargs.get("cap_add") or [])
+                cap_add.add("SYS_ADMIN")
+                host_config_kwargs["cap_add"] = sorted(cap_add)
+                security_opt = list(host_config_kwargs.get("security_opt") or [])
+                security_opt = [s for s in security_opt if not s.startswith(("apparmor=", "seccomp="))]
+                security_opt.append("apparmor=unconfined")
+                security_opt.append("seccomp=unconfined")
+                host_config_kwargs["security_opt"] = security_opt
+                tmpfs = dict(host_config_kwargs.get("tmpfs") or {})
+                tmpfs[ISOLATION_UPPER_MOUNT_PATH] = ""
+                host_config_kwargs["tmpfs"] = tmpfs
+                logger.warning(
+                    "sandbox %s: granting CAP_SYS_ADMIN + apparmor/seccomp=unconfined + tmpfs for bwrap isolation (bootstrap.execd.isolation=enable)",
+                    sandbox_id,
+                )
 
             created_container = self._create_and_start_container(
                 sandbox_id,

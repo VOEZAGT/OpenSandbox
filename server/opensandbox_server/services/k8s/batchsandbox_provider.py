@@ -28,6 +28,7 @@ from opensandbox_server.config import (
     EGRESS_MODE_DNS,
     INGRESS_MODE_GATEWAY,
 )
+from opensandbox_server.extensions.keys import BOOTSTRAP_EXECD_ISOLATION_KEY
 from opensandbox_server.services.constants import OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT
 from opensandbox_server.services.helpers import format_ingress_endpoint
 from opensandbox_server.api.schema import Endpoint, ImageSpec, NetworkPolicy, PlatformSpec, Volume
@@ -177,20 +178,27 @@ class BatchSandboxProvider(WorkloadProvider):
             env=main_env,
             resource_limits=resource_limits,
             has_network_policy=network_policy is not None,
+            isolation_enabled=(extensions or {}).get(BOOTSTRAP_EXECD_ISOLATION_KEY) == "enable",
             image_pull_policy=self.image_pull_policy,
             resource_requests=resource_requests or None,
         )
         
         containers = [_container_to_dict(main_container)]
+        pod_volumes = [
+            {
+                "name": "opensandbox-bin",
+                "emptyDir": {}
+            }
+        ]
+        if (extensions or {}).get(BOOTSTRAP_EXECD_ISOLATION_KEY) == "enable":
+            pod_volumes.append({
+                "name": "isolation-upper",
+                "emptyDir": {}
+            })
         pod_spec = {
             "initContainers": [_container_to_dict(init_container)],
             "containers": containers,
-            "volumes": [
-                {
-                    "name": "opensandbox-bin",
-                    "emptyDir": {}
-                }
-            ],
+            "volumes": pod_volumes,
         }
         if windows_profile:
             apply_windows_profile_overrides(
