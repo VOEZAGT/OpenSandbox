@@ -30,6 +30,8 @@ import com.alibaba.opensandbox.sandbox.domain.pool.PoolLifecycleState
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolSnapshot
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolState
 import com.alibaba.opensandbox.sandbox.domain.pool.PoolStateStore
+import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreateContext
+import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreator
 import com.alibaba.opensandbox.sandbox.domain.pool.SandboxPreparer
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.PoolReconciler
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.ReconcileState
@@ -91,6 +93,7 @@ class SandboxPool internal constructor(
     private val stateStore: PoolStateStore = config.stateStore
     private val connectionConfig: ConnectionConfig = config.connectionConfig
     private val creationSpec: PoolCreationSpec = config.creationSpec
+    private val sandboxCreator: PooledSandboxCreator? = config.sandboxCreator
     private val reconcileState = ReconcileState(config.degradedThreshold)
 
     @Volatile
@@ -209,7 +212,13 @@ class SandboxPool internal constructor(
                 throw PoolNotRunningException("Cannot acquire when pool state is $state")
             }
             val poolName = config.poolName
-            val sandboxId = stateStore.tryTakeIdle(poolName)
+            val takeResult = stateStore.tryTakeIdle(poolName, config.acquireMinRemainingTtl)
+            val sandboxId = takeResult.sandboxId
+            // Defer the cleanup of below-threshold-but-still-alive sandboxes until after the
+            // chosen candidate is connected and renewed. Doing it inline (synchronously, before
+            // connect) would let slow kill RPCs eat the candidate's remaining TTL — exactly the
+            // race this PR is trying to fix.
+            val pendingKill = takeResult.discardedAliveSandboxIds
             var noIdleReason: String? = null // null = got a sandbox from idle; non-null = reason we have no usable idle
             var idleConnectFailure: Exception? = null
             if (sandboxId != null) {
@@ -225,6 +234,10 @@ class SandboxPool internal constructor(
                                 config.acquireHealthCheck?.let { healthCheck(it) } ?: this
                             }.connect()
                     sandboxTimeout?.let { sandbox.renew(it) }
+                    // Candidate is connected and (optionally) renewed. Now safe to clean up the
+                    // discarded-alive sandboxes; offload to the warmup executor so the caller
+                    // does not wait for N kill RPCs.
+                    scheduleKillDiscardedAlive(poolName, pendingKill, source = "acquire")
                     logger.debug(
                         "Acquire from idle: pool_name={} sandbox_id={} policy={}",
                         poolName,
@@ -252,6 +265,11 @@ class SandboxPool internal constructor(
             } else {
                 noIdleReason = "idle buffer empty"
             }
+            // Reaching here means we did not return a sandbox from idle. Still kick off the
+            // deferred cleanup so the discarded-alive sandboxes do not linger; FAIL_FAST throws
+            // and DIRECT_CREATE falls through to a fresh sandbox creation, neither of which
+            // benefits from a synchronous kill.
+            scheduleKillDiscardedAlive(poolName, pendingKill, source = "acquire")
             val reason = noIdleReason!!
             if (policy == AcquirePolicy.FAIL_FAST) {
                 logger.debug("Acquire FAIL_FAST: pool_name={} reason={}", poolName, reason)
@@ -412,6 +430,76 @@ class SandboxPool internal constructor(
 
     private fun resolveMaxIdle(): Int = stateStore.getMaxIdle(config.poolName) ?: currentMaxIdle
 
+    /**
+     * Offload [killDiscardedAlive] to the warmup executor so the caller does not block on the
+     * kill RPCs. Falls back to inline execution when no executor is available (e.g. the pool is
+     * shutting down) — better to slow the caller than to drop the cleanup entirely.
+     */
+    private fun scheduleKillDiscardedAlive(
+        poolName: String,
+        sandboxIds: List<String>,
+        source: String,
+    ) {
+        if (sandboxIds.isEmpty()) return
+        val executor = warmupExecutor
+        if (executor == null) {
+            killDiscardedAlive(poolName, sandboxIds, source)
+            return
+        }
+        try {
+            executor.submit {
+                killDiscardedAlive(poolName, sandboxIds, source)
+            }
+        } catch (e: Exception) {
+            // Executor may reject if the pool is mid-shutdown; fall back to inline kill.
+            logger.debug(
+                "Discarded-alive kill submit rejected, running inline: pool_name={} count={} error={}",
+                poolName,
+                sandboxIds.size,
+                e.message,
+            )
+            killDiscardedAlive(poolName, sandboxIds, source)
+        }
+    }
+
+    /**
+     * Best-effort terminate sandboxes the store dropped because their remaining TTL fell below
+     * `acquireMinRemainingTtl`. The store has already removed them from idle membership; without
+     * this kill they would linger on the server until their TTL elapses, exceeding the intended
+     * pool size during the gap.
+     *
+     * Failures are logged and swallowed: the caller's primary outcome (acquire/reconcile) must
+     * not be impacted by a janitor failure.
+     */
+    private fun killDiscardedAlive(
+        poolName: String,
+        sandboxIds: List<String>,
+        source: String,
+    ) {
+        if (sandboxIds.isEmpty()) return
+        val manager = sandboxManager ?: return
+        for (sandboxId in sandboxIds) {
+            try {
+                manager.killSandbox(sandboxId)
+                logger.debug(
+                    "Killed near-expiry idle sandbox: pool_name={} sandbox_id={} source={}",
+                    poolName,
+                    sandboxId,
+                    source,
+                )
+            } catch (e: Exception) {
+                logger.warn(
+                    "Failed to kill near-expiry idle sandbox (best-effort, will expire server-side): " +
+                        "pool_name={} sandbox_id={} source={} error={}",
+                    poolName,
+                    sandboxId,
+                    source,
+                    e.message,
+                )
+            }
+        }
+    }
+
     private fun createSandboxManager(): SandboxManager = sandboxManagerFactory(connectionConfig.copyWithoutConnectionPool())
 
     private fun runReconcileTick() {
@@ -435,16 +523,23 @@ class SandboxPool internal constructor(
     }
 
     /**
-     * Creates one sandbox via [Sandbox.builder], waits for readiness (no skipHealthCheck),
-     * then returns its id. Caller must put the id into the store; the created [Sandbox]
-     * is closed immediately so only the id is kept in the pool.
+     * Creates one sandbox, waits for readiness, then returns its id. Caller must put the
+     * id into the store; the created [Sandbox] is closed immediately so only the id is
+     * kept in the pool.
      */
     private fun createOneSandbox(): String? {
         beginOperation()
         return try {
-            val sandbox = buildSandboxFromSpec()
+            val sandbox = buildWarmupSandbox()
             try {
                 config.warmupSandboxPreparer?.prepare(sandbox)
+                // The server-side TTL has been ticking since sandbox creation; readiness
+                // wait and `warmupSandboxPreparer` can both consume meaningful time (think
+                // initialization scripts). Renew right before handing the id back to the
+                // reconciler so the store's stamped expiry (now + idleTimeout) actually matches
+                // what the server will honor — otherwise `acquireMinRemainingTtl` overestimates
+                // remaining TTL by the warmup duration.
+                sandbox.renew(config.idleTimeout)
                 sandbox.id
             } catch (e: Exception) {
                 try {
@@ -470,7 +565,19 @@ class SandboxPool internal constructor(
         }
     }
 
-    private fun buildSandboxFromSpec(): Sandbox {
+    private fun buildWarmupSandbox(): Sandbox {
+        sandboxCreator?.let {
+            return buildSandboxFromCreator(
+                creator = it,
+                idleTimeout = config.idleTimeout,
+                reason = PooledSandboxCreateContext.Reason.WARMUP,
+                readyTimeout = config.warmupReadyTimeout,
+                healthCheckPollingInterval = config.warmupHealthCheckPollingInterval,
+                skipHealthCheck = config.warmupSkipHealthCheck,
+                customHealthCheck = config.warmupHealthCheck,
+            )
+        }
+
         val builder =
             creationSpec.applyToBuilder(
                 Sandbox.builder()
@@ -485,6 +592,32 @@ class SandboxPool internal constructor(
     }
 
     private fun directCreate(sandboxTimeout: Duration?): Sandbox {
+        sandboxCreator?.let {
+            val sandbox =
+                buildSandboxFromCreator(
+                    creator = it,
+                    idleTimeout = config.idleTimeout,
+                    reason = PooledSandboxCreateContext.Reason.DIRECT_CREATE,
+                    readyTimeout = config.acquireReadyTimeout,
+                    healthCheckPollingInterval = config.acquireHealthCheckPollingInterval,
+                    skipHealthCheck = config.acquireSkipHealthCheck,
+                    customHealthCheck = config.acquireHealthCheck,
+                )
+            sandboxTimeout?.let { timeout ->
+                try {
+                    sandbox.renew(timeout)
+                } catch (e: Exception) {
+                    try {
+                        sandbox.kill()
+                    } finally {
+                        sandbox.close()
+                    }
+                    throw e
+                }
+            }
+            return sandbox
+        }
+
         val builder =
             creationSpec.applyToBuilder(
                 Sandbox.builder()
@@ -498,6 +631,30 @@ class SandboxPool internal constructor(
         val sandbox = builder.build()
         sandboxTimeout?.let { sandbox.renew(it) }
         return sandbox
+    }
+
+    private fun buildSandboxFromCreator(
+        creator: PooledSandboxCreator,
+        idleTimeout: Duration,
+        reason: PooledSandboxCreateContext.Reason,
+        readyTimeout: Duration,
+        healthCheckPollingInterval: Duration,
+        skipHealthCheck: Boolean,
+        customHealthCheck: ((Sandbox) -> Boolean)?,
+    ): Sandbox {
+        val context =
+            PooledSandboxCreateContext(
+                poolName = config.poolName,
+                ownerId = config.ownerId,
+                idleTimeout = idleTimeout,
+                reason = reason,
+                readyTimeout = readyTimeout,
+                healthCheckPollingInterval = healthCheckPollingInterval,
+                skipHealthCheck = skipHealthCheck,
+                healthCheck = customHealthCheck,
+                connectionConfig = connectionConfig,
+            )
+        return creator.create(context)
     }
 
     private fun killSandboxBestEffort(sandboxId: String) {
@@ -684,6 +841,11 @@ class SandboxPool internal constructor(
             return this
         }
 
+        fun sandboxCreator(sandboxCreator: PooledSandboxCreator): Builder {
+            configBuilder.sandboxCreator(sandboxCreator)
+            return this
+        }
+
         fun warmupConcurrency(warmupConcurrency: Int): Builder {
             configBuilder.warmupConcurrency(warmupConcurrency)
             return this
@@ -721,6 +883,11 @@ class SandboxPool internal constructor(
 
         fun acquireSkipHealthCheck(acquireSkipHealthCheck: Boolean = true): Builder {
             configBuilder.acquireSkipHealthCheck(acquireSkipHealthCheck)
+            return this
+        }
+
+        fun acquireMinRemainingTtl(acquireMinRemainingTtl: Duration): Builder {
+            configBuilder.acquireMinRemainingTtl(acquireMinRemainingTtl)
             return this
         }
 
@@ -781,6 +948,7 @@ internal fun PoolCreationSpec.applyToBuilder(builder: Sandbox.Builder): Sandbox.
             .secureAccess(secureAccess)
 
     networkPolicy?.let { configuredBuilder.networkPolicy(it) }
+    credentialProxy?.let { configuredBuilder.credentialProxy(it) }
     platform?.let { configuredBuilder.platform(it) }
     return configuredBuilder
 }

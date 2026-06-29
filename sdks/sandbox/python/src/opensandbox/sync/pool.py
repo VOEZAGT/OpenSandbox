@@ -36,9 +36,15 @@ from opensandbox.pool_types import (
     IdleEntry,
     PoolConfig,
     PoolCreationSpec,
+    PooledSandboxCreateContext,
+    PooledSandboxCreateReason,
+    PooledSandboxCreator,
     PoolLifecycleState,
     PoolSnapshot,
     PoolState,
+)
+from opensandbox.pool_types import (
+    try_take_idle_with_min_ttl as _try_take_idle_with_min_ttl,
 )
 from opensandbox.sync.manager import SandboxManagerSync
 from opensandbox.sync.sandbox import SandboxSync
@@ -75,10 +81,12 @@ class SandboxPoolSync:
         warmup_skip_health_check: bool = False,
         idle_timeout: timedelta = timedelta(hours=24),
         drain_timeout: timedelta = timedelta(seconds=30),
+        acquire_min_remaining_ttl: timedelta | None = None,
         sandbox_manager_factory: Callable[
             [ConnectionConfigSync], SandboxManagerSync
         ] = SandboxManagerSync.create,
         sandbox_factory: type[SandboxSync] = SandboxSync,
+        sandbox_creator: PooledSandboxCreator | None = None,
     ) -> None:
         self._config = PoolConfig(
             pool_name=pool_name,
@@ -102,6 +110,8 @@ class SandboxPoolSync:
             warmup_skip_health_check=warmup_skip_health_check,
             idle_timeout=idle_timeout,
             drain_timeout=drain_timeout,
+            acquire_min_remaining_ttl=acquire_min_remaining_ttl,
+            sandbox_creator=sandbox_creator,
         )
         self._state_store = self._config.state_store
         self._connection_config = connection_config
@@ -164,7 +174,9 @@ class SandboxPoolSync:
     ) -> SandboxSync:
         if self._lifecycle_state != PoolLifecycleState.RUNNING:
             state = self._lifecycle_state
-            raise PoolNotRunningException(f"Cannot acquire when pool state is {state.value}")
+            raise PoolNotRunningException(
+                f"Cannot acquire when pool state is {state.value}"
+            )
         self._begin_operation()
         try:
             if self._lifecycle_state != PoolLifecycleState.RUNNING:
@@ -173,7 +185,16 @@ class SandboxPoolSync:
                     f"Cannot acquire when pool state is {state.value}"
                 )
             pool_name = self._config.pool_name
-            sandbox_id = self._state_store.try_take_idle(pool_name)
+            take_result = _try_take_idle_with_min_ttl(
+                self._state_store,
+                pool_name,
+                self._config.acquire_min_remaining_ttl,
+            )
+            sandbox_id = take_result.sandbox_id
+            # Defer cleanup of below-threshold-but-still-alive sandboxes until after the chosen
+            # candidate is connected and renewed. Doing it inline before connect would let slow
+            # kill RPCs eat the candidate's remaining TTL — exactly the race this PR is fixing.
+            pending_kill = take_result.discarded_alive_sandbox_ids
             no_idle_reason: str | None = None
             idle_connect_failure: Exception | None = None
             if sandbox_id is not None:
@@ -190,6 +211,12 @@ class SandboxPoolSync:
                     )
                     if sandbox_timeout is not None:
                         sandbox.renew(sandbox_timeout)
+                    # Candidate is connected and (optionally) renewed. Now safe to clean up the
+                    # discarded-alive sandboxes; offload to the warmup executor so the caller
+                    # does not wait for N kill RPCs.
+                    self._schedule_kill_discarded_alive(
+                        pool_name, pending_kill, source="acquire"
+                    )
                     return sandbox
                 except Exception as exc:
                     idle_connect_failure = exc
@@ -206,6 +233,11 @@ class SandboxPoolSync:
             else:
                 no_idle_reason = "idle buffer empty"
 
+            # Reaching here means we did not return a sandbox from idle. Still kick off the
+            # deferred cleanup so the discarded-alive sandboxes do not linger.
+            self._schedule_kill_discarded_alive(
+                pool_name, pending_kill, source="acquire"
+            )
             reason = no_idle_reason or "idle buffer empty"
             if policy == AcquirePolicy.FAIL_FAST:
                 if sandbox_id is not None:
@@ -304,7 +336,11 @@ class SandboxPoolSync:
             self._close_provider()
 
     def _run_scheduler(self, stop_event: threading.Event) -> None:
-        initial_delay = 0 if self._config.max_idle > 0 else self._config.reconcile_interval.total_seconds()
+        initial_delay = (
+            0
+            if self._config.max_idle > 0
+            else self._config.reconcile_interval.total_seconds()
+        )
         if initial_delay > 0 and stop_event.wait(initial_delay):
             return
         while not stop_event.is_set():
@@ -332,7 +368,7 @@ class SandboxPoolSync:
                 config=self._config.with_max_idle(self._resolve_max_idle()),
                 state_store=self._state_store,
                 create_one=self._create_one_sandbox,
-                on_discard_sandbox=self._kill_sandbox_best_effort,
+                on_discard_sandbox=self._discard_sandbox_callback,
                 reconcile_state=self._reconcile_state,
                 warmup_executor=executor,
             )
@@ -348,7 +384,7 @@ class SandboxPoolSync:
     def _create_one_sandbox(self) -> str | None:
         self._begin_operation()
         try:
-            sandbox = self._build_sandbox_from_spec()
+            sandbox = self._build_warmup_sandbox()
             try:
                 if self._config.warmup_sandbox_preparer is not None:
                     self._config.warmup_sandbox_preparer(sandbox)
@@ -358,6 +394,12 @@ class SandboxPoolSync:
                     except Exception:
                         pass
                     return None
+                # The server-side TTL has been ticking since sandbox creation;
+                # readiness wait and `warmup_sandbox_preparer` can both consume meaningful time.
+                # Renew right before handing the id back to the reconciler so the store's
+                # stamped expiry actually matches what the server will honor — otherwise
+                # `acquire_min_remaining_ttl` overestimates remaining TTL by the warmup duration.
+                sandbox.renew(self._config.idle_timeout)
                 return sandbox.id
             except Exception:
                 try:
@@ -370,7 +412,17 @@ class SandboxPoolSync:
         finally:
             self._end_operation()
 
-    def _build_sandbox_from_spec(self) -> SandboxSync:
+    def _build_warmup_sandbox(self) -> SandboxSync:
+        if self._config.sandbox_creator is not None:
+            return self._build_sandbox_from_creator(
+                creator=self._config.sandbox_creator,
+                reason=PooledSandboxCreateReason.WARMUP,
+                ready_timeout=self._config.warmup_ready_timeout,
+                health_check_polling_interval=self._config.warmup_health_check_polling_interval,
+                skip_health_check=self._config.warmup_skip_health_check,
+                health_check=self._config.warmup_health_check,
+            )
+
         spec = self._creation_spec
         return self._sandbox_factory.create(
             spec.image,
@@ -392,6 +444,26 @@ class SandboxPoolSync:
         )
 
     def _direct_create(self, sandbox_timeout: timedelta | None) -> SandboxSync:
+        if self._config.sandbox_creator is not None:
+            sandbox = self._build_sandbox_from_creator(
+                creator=self._config.sandbox_creator,
+                reason=PooledSandboxCreateReason.DIRECT_CREATE,
+                ready_timeout=self._config.acquire_ready_timeout,
+                health_check_polling_interval=self._config.acquire_health_check_polling_interval,
+                skip_health_check=self._config.acquire_skip_health_check,
+                health_check=self._config.acquire_health_check,
+            )
+            if sandbox_timeout is not None:
+                try:
+                    sandbox.renew(sandbox_timeout)
+                except BaseException:
+                    try:
+                        sandbox.kill()
+                    finally:
+                        sandbox.close()
+                    raise
+            return sandbox
+
         spec = self._creation_spec
         sandbox = self._sandbox_factory.create(
             spec.image,
@@ -422,6 +494,29 @@ class SandboxPoolSync:
                 raise
         return sandbox
 
+    def _build_sandbox_from_creator(
+        self,
+        *,
+        creator: PooledSandboxCreator,
+        reason: PooledSandboxCreateReason,
+        ready_timeout: timedelta,
+        health_check_polling_interval: timedelta,
+        skip_health_check: bool,
+        health_check: Callable[[SandboxSync], bool] | None,
+    ) -> SandboxSync:
+        context = PooledSandboxCreateContext(
+            pool_name=self._config.pool_name,
+            owner_id=str(self._config.owner_id),
+            idle_timeout=self._config.idle_timeout,
+            reason=reason,
+            ready_timeout=ready_timeout,
+            health_check_polling_interval=health_check_polling_interval,
+            skip_health_check=skip_health_check,
+            health_check=health_check,
+            connection_config=self._connection_for_pool_resource(),
+        )
+        return creator(context)
+
     def _resolve_max_idle(self) -> int:
         shared = self._state_store.get_max_idle(self._config.pool_name)
         return self._current_max_idle if shared is None else shared
@@ -430,16 +525,35 @@ class SandboxPoolSync:
         return self._sandbox_manager_factory(self._connection_for_pool_resource())
 
     def _connection_for_pool_resource(self) -> ConnectionConfigSync:
-        if self._connection_config.transport is not None and not self._connection_config._owns_transport:
+        if (
+            self._connection_config.transport is not None
+            and not self._connection_config._owns_transport
+        ):
             return self._connection_config
         config = self._connection_config.model_copy(update={"transport": None})
         config._owns_transport = True
         return config
 
-    def _kill_sandbox_best_effort(self, sandbox_id: str) -> None:
+    def _discard_sandbox_callback(self, sandbox_id: str) -> None:
+        """``Callable[[str], None]`` adapter for the reconciler's ``on_discard_sandbox``
+        hook. The reconciler does not care whether the kill succeeded — it only needs the
+        sandbox to be removed from the pool's bookkeeping — so we drop the bool return
+        value here.
+        """
+        self._kill_sandbox_best_effort(sandbox_id)
+
+    def _kill_sandbox_best_effort(self, sandbox_id: str) -> bool:
+        """Best-effort kill a sandbox via the pool's manager.
+
+        Returns ``True`` on a confirmed kill, ``False`` if no manager is available or the
+        kill raised. Failures are logged at WARNING and swallowed so the caller's primary
+        outcome is unaffected.
+        """
+        if self._sandbox_manager is None:
+            return False
         try:
-            if self._sandbox_manager is not None:
-                self._sandbox_manager.kill_sandbox(sandbox_id)
+            self._sandbox_manager.kill_sandbox(sandbox_id)
+            return True
         except Exception as exc:
             logger.warning(
                 "Pool sandbox cleanup failed: pool_name=%s sandbox_id=%s error=%s",
@@ -447,6 +561,55 @@ class SandboxPoolSync:
                 sandbox_id,
                 exc,
             )
+            return False
+
+    def _schedule_kill_discarded_alive(
+        self,
+        pool_name: str,
+        sandbox_ids: tuple[str, ...],
+        source: str,
+    ) -> None:
+        """Offload :meth:`_kill_discarded_alive` to the warmup executor so the caller does not
+        block on the kill RPCs. Falls back to inline execution when no executor is available
+        (e.g. mid-shutdown) — better to slow the caller than to drop the cleanup entirely.
+        """
+        if not sandbox_ids:
+            return
+        executor = self._warmup_executor
+        if executor is None:
+            self._kill_discarded_alive(pool_name, sandbox_ids, source)
+            return
+        try:
+            executor.submit(self._kill_discarded_alive, pool_name, sandbox_ids, source)
+        except Exception as exc:
+            logger.debug(
+                "Discarded-alive kill submit rejected, running inline: pool_name=%s count=%d error=%s",
+                pool_name,
+                len(sandbox_ids),
+                exc,
+            )
+            self._kill_discarded_alive(pool_name, sandbox_ids, source)
+
+    def _kill_discarded_alive(
+        self,
+        pool_name: str,
+        sandbox_ids: tuple[str, ...],
+        source: str,
+    ) -> None:
+        """Best-effort terminate sandboxes the store dropped because their remaining TTL
+        fell below ``acquire_min_remaining_ttl``. Without this, alive-but-near-expiry
+        sandboxes would linger past their pool membership until server-side TTL elapses.
+        """
+        if not sandbox_ids:
+            return
+        for sandbox_id in sandbox_ids:
+            if self._kill_sandbox_best_effort(sandbox_id):
+                logger.debug(
+                    "Killed near-expiry idle sandbox: pool_name=%s sandbox_id=%s source=%s",
+                    pool_name,
+                    sandbox_id,
+                    source,
+                )
 
     def _begin_operation(self) -> None:
         with self._in_flight_condition:
@@ -477,7 +640,11 @@ class SandboxPoolSync:
     ) -> None:
         self._stop_event.set()
         thread = self._scheduler_thread
-        if join_scheduler and thread is not None and thread is not threading.current_thread():
+        if (
+            join_scheduler
+            and thread is not None
+            and thread is not threading.current_thread()
+        ):
             thread.join(timeout=5)
         if join_scheduler:
             self._scheduler_thread = None
@@ -487,7 +654,9 @@ class SandboxPoolSync:
             if wait_for_warmup:
                 executor.shutdown(wait=True)
             else:
-                self._await_executor_threads(executor, _WARMUP_TERMINATION_TIMEOUT_SECONDS)
+                self._await_executor_threads(
+                    executor, _WARMUP_TERMINATION_TIMEOUT_SECONDS
+                )
         self._warmup_executor = None
         self._release_primary_lock_best_effort()
 

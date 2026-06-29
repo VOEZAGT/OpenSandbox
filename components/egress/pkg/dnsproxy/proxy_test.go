@@ -22,6 +22,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 
+	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/nftables"
 	"github.com/alibaba/opensandbox/egress/pkg/policy"
 )
@@ -80,6 +81,48 @@ func TestExtractResolvedIPs_EmptyOrNil(t *testing.T) {
 	require.Nil(t, extractResolvedIPs(msg), "empty answer: expected nil")
 	msg.Answer = []dns.RR{&dns.CNAME{Hdr: dns.RR_Header{Name: "x."}, Target: "y."}}
 	require.Nil(t, extractResolvedIPs(msg), "CNAME only: expected nil")
+}
+
+func TestForwardAddsEDNS0BufferSize(t *testing.T) {
+	t.Cleanup(func() { resetNameserverExemptCache(t) })
+	t.Setenv(constants.EnvNameserverExempt, "127.0.0.1")
+	resetNameserverExemptCache(t)
+
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	seen := make(chan uint16, 1)
+	server := &dns.Server{
+		PacketConn: conn,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			opt := r.IsEdns0()
+			require.NotNil(t, opt)
+			seen <- opt.UDPSize()
+
+			resp := new(dns.Msg)
+			resp.SetReply(r)
+			resp.Answer = []dns.RR{
+				&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: net.ParseIP("1.2.3.4")},
+			}
+			_ = w.WriteMsg(resp)
+		}),
+	}
+	go func() { _ = server.ActivateAndServe() }()
+	t.Cleanup(func() { _ = server.Shutdown() })
+
+	proxy := &Proxy{
+		upstreams:               []string{conn.LocalAddr().String()},
+		activeUpstreams:         []string{conn.LocalAddr().String()},
+		upstreamExchangeTimeout: time.Second,
+	}
+	query := new(dns.Msg)
+	query.SetQuestion("example.com.", dns.TypeA)
+
+	resp, err := proxy.forward(query)
+	require.NoError(t, err)
+	require.Len(t, resp.Answer, 1)
+	require.Equal(t, uint16(4096), <-seen)
 }
 
 func TestSetOnResolved(t *testing.T) {
@@ -164,4 +207,32 @@ func TestMaybeNotifyResolved_NoCallWhenNoAOrAAAA(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		// Expected: no callback
 	}
+}
+
+func TestProxyShouldSkipOutboundLog_Default(t *testing.T) {
+	p := &Proxy{}
+	require.False(t, p.shouldSkipOutboundLog("metadata.internal"),
+		"default (no SetLogSkip call) must preserve current behavior: log every outbound")
+}
+
+func TestProxyShouldSkipOutboundLog_MatchesAndMisses(t *testing.T) {
+	p := &Proxy{}
+	p.SetLogSkip([]string{"metadata.internal", "*.cluster.local"})
+
+	require.True(t, p.shouldSkipOutboundLog("metadata.internal"), "exact pattern hit")
+	require.True(t, p.shouldSkipOutboundLog("svc.cluster.local"), "wildcard subdomain hit")
+	require.True(t, p.shouldSkipOutboundLog("METADATA.INTERNAL."), "case + trailing dot normalised")
+	require.False(t, p.shouldSkipOutboundLog("cluster.local"),
+		"wildcard *.cluster.local must not match bare cluster.local")
+	require.False(t, p.shouldSkipOutboundLog("evil.com"), "non-listed host must not be skipped")
+}
+
+func TestProxyShouldSkipOutboundLog_ClearedByEmptyList(t *testing.T) {
+	p := &Proxy{}
+	p.SetLogSkip([]string{"metadata.internal"})
+	require.True(t, p.shouldSkipOutboundLog("metadata.internal"))
+
+	p.SetLogSkip(nil)
+	require.False(t, p.shouldSkipOutboundLog("metadata.internal"),
+		"clearing the list must re-enable logging for all hosts")
 }

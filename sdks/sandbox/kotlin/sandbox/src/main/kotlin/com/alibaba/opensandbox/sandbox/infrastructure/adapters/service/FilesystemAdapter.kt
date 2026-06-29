@@ -23,6 +23,7 @@ import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError.Companion.UNEXPECTED_RESPONSE
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ContentReplaceEntry
+import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.ContentReplaceResult
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.EntryInfo
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.MoveEntry
 import com.alibaba.opensandbox.sandbox.domain.models.execd.filesystem.SearchEntry
@@ -89,9 +90,11 @@ internal class FilesystemAdapter(
         path: String,
         encoding: String,
         range: String?,
+        offset: Int?,
+        limit: Int?,
     ): String {
         try {
-            val request = buildDownloadRequest(path, range)
+            val request = buildDownloadRequest(path, range, offset, limit)
             httpClientProvider.httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val errorBodyString = response.body?.string()
@@ -117,9 +120,11 @@ internal class FilesystemAdapter(
     override fun readByteArray(
         path: String,
         range: String?,
+        offset: Int?,
+        limit: Int?,
     ): ByteArray {
         try {
-            val request = buildDownloadRequest(path, range)
+            val request = buildDownloadRequest(path, range, offset, limit)
             httpClientProvider.httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val errorBodyString = response.body?.string()
@@ -143,9 +148,11 @@ internal class FilesystemAdapter(
     override fun readStream(
         path: String,
         range: String?,
+        offset: Int?,
+        limit: Int?,
     ): InputStream {
         try {
-            val request = buildDownloadRequest(path, range)
+            val request = buildDownloadRequest(path, range, offset, limit)
             val response = httpClientProvider.httpClient.newCall(request).execute()
 
             if (!response.isSuccessful) {
@@ -286,6 +293,18 @@ internal class FilesystemAdapter(
         }
     }
 
+    override fun listDirectory(
+        path: String,
+        depth: Int?,
+    ): List<EntryInfo> {
+        return try {
+            api.listDirectory(path, depth).map { it.toEntryInfo() }
+        } catch (e: Exception) {
+            logger.error("Failed to list directory {}", path, e)
+            throw e.toSandboxException()
+        }
+    }
+
     override fun moveFiles(entries: List<MoveEntry>) {
         return try {
             val renameItems = entries.toApiRenameFileItems()
@@ -307,9 +326,31 @@ internal class FilesystemAdapter(
     }
 
     override fun replaceContents(entries: List<ContentReplaceEntry>) {
+        try {
+            val replaceMap = entries.toApiReplaceFileContentMap()
+            try {
+                api.replaceContent(replaceMap)
+            } catch (_: NullPointerException) {
+                // Older execd versions return an empty body for verbose=false,
+                // which the generated client cannot deserialize. The replacement
+                // itself succeeded if no HTTP error was thrown.
+            }
+        } catch (e: Exception) {
+            logger.error("Failed to replace contents", e)
+            throw e.toSandboxException()
+        }
+    }
+
+    override fun replaceContentsDetailed(entries: List<ContentReplaceEntry>): List<ContentReplaceResult> {
         return try {
             val replaceMap = entries.toApiReplaceFileContentMap()
-            api.replaceContent(replaceMap)
+            val response = api.replaceContent(replaceMap, verbose = true)
+            response.map { (path, result) ->
+                ContentReplaceResult(
+                    path = path,
+                    replacedCount = result.replacedCount,
+                )
+            }
         } catch (e: Exception) {
             logger.error("Failed to replace contents", e)
             throw e.toSandboxException()
@@ -368,17 +409,25 @@ internal class FilesystemAdapter(
     private fun buildDownloadRequest(
         path: String,
         range: String?,
+        offset: Int? = null,
+        limit: Int? = null,
     ): Request {
         val baseUrlString = "${httpClientProvider.config.protocol}://${execdEndpoint.endpoint}$FILESYSTEM_DOWNLOAD_PATH"
-        val httpUrl =
+        val urlBuilder =
             baseUrlString.toHttpUrl()
                 .newBuilder()
                 .addQueryParameter("path", path)
-                .build()
+
+        if (offset != null) {
+            urlBuilder.addQueryParameter("offset", offset.toString())
+        }
+        if (limit != null) {
+            urlBuilder.addQueryParameter("limit", limit.toString())
+        }
 
         val requestBuilder =
             Request.Builder()
-                .url(httpUrl)
+                .url(urlBuilder.build())
                 .headers(execdEndpoint.headers.toHeaders())
                 .get()
 

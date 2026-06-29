@@ -1169,7 +1169,7 @@ class TestSandboxE2ESync:
         # Replace file contents via API (replace_contents)
         before_replace_info = after_update_info
         time.sleep(0.05)
-        sandbox.files.replace_contents(
+        replace_results = sandbox.files.replace_contents_detailed(
             [
                 ContentReplaceEntry(
                     path=test_file1,
@@ -1178,11 +1178,63 @@ class TestSandboxE2ESync:
                 )
             ]
         )
+        assert len(replace_results) == 1
+        assert replace_results[0].path == test_file1
+        assert replace_results[0].replaced_count == 1
         replaced_content1 = sandbox.files.read_file(test_file1, encoding="utf-8")
         assert "Replaced line in file1" in replaced_content1
         assert "Appended line to file1" not in replaced_content1
         after_replace_info = sandbox.files.get_file_info([test_file1])[test_file1]
         _assert_modified_updated(before_replace_info.modified_at, after_replace_info.modified_at, min_delta_ms=1)
+
+        # Replace with no match (replacedCount=0)
+        no_match_results = sandbox.files.replace_contents_detailed([
+            ContentReplaceEntry(
+                path=test_file1,
+                old_content="this string does not exist in file",
+                new_content="irrelevant",
+            )
+        ])
+        assert len(no_match_results) == 1
+        assert no_match_results[0].path == test_file1
+        assert no_match_results[0].replaced_count == 0
+        assert sandbox.files.read_file(test_file1, encoding="utf-8") == replaced_content1
+
+        # Replace with multiple matches (replacedCount>1)
+        multi_match_file = f"{test_dir1}/multi_match.txt"
+        sandbox.files.write_files([WriteEntry(path=multi_match_file, data="foo bar foo baz foo")])
+        multi_results = sandbox.files.replace_contents_detailed([
+            ContentReplaceEntry(path=multi_match_file, old_content="foo", new_content="qux")
+        ])
+        assert len(multi_results) == 1
+        assert multi_results[0].replaced_count == 3
+        assert sandbox.files.read_file(multi_match_file, encoding="utf-8") == "qux bar qux baz qux"
+
+        # Batch replace across multiple files
+        batch_file_a = f"{test_dir1}/batch_a.txt"
+        batch_file_b = f"{test_dir1}/batch_b.txt"
+        sandbox.files.write_files([
+            WriteEntry(path=batch_file_a, data="hello world"),
+            WriteEntry(path=batch_file_b, data="hello hello"),
+        ])
+        batch_results = sandbox.files.replace_contents_detailed([
+            ContentReplaceEntry(path=batch_file_a, old_content="hello", new_content="hi"),
+            ContentReplaceEntry(path=batch_file_b, old_content="hello", new_content="hi"),
+        ])
+        assert len(batch_results) == 2
+        results_by_path = {r.path: r.replaced_count for r in batch_results}
+        assert results_by_path[batch_file_a] == 1
+        assert results_by_path[batch_file_b] == 2
+        assert sandbox.files.read_file(batch_file_a, encoding="utf-8") == "hi world"
+        assert sandbox.files.read_file(batch_file_b, encoding="utf-8") == "hi hi"
+
+        sandbox.files.delete_files([multi_match_file, batch_file_a, batch_file_b])
+
+        # Verify original replace_contents (no return value) still works
+        sandbox.files.replace_contents([
+            ContentReplaceEntry(path=test_file1, old_content="Replaced line in file1", new_content="Final line in file1")
+        ])
+        assert "Final line in file1" in sandbox.files.read_file(test_file1, encoding="utf-8")
 
         # Move/rename a file via API (move_files)
         moved_path = f"{test_dir2}/moved_file3.txt"
@@ -1222,6 +1274,32 @@ class TestSandboxE2ESync:
         assert verify_dirs_deleted.error is None
         assert len(verify_dirs_deleted.logs.stdout) == 1
         assert verify_dirs_deleted.logs.stdout[0].text == "OK"
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.order(4)
+    def test_03a_line_based_file_reading(self) -> None:
+        """Test line-based file reading with offset and limit."""
+        TestSandboxE2ESync._ensure_sandbox_created()
+        sandbox = TestSandboxE2ESync.sandbox
+        assert sandbox is not None
+
+        test_path = "/tmp/line-read-e2e.txt"
+        content = "line1\nline2\nline3\nline4\nline5"
+        sandbox.files.write_files([WriteEntry(path=test_path, data=content)])
+
+        # offset=2, limit=2 → lines 2-3
+        result = sandbox.files.read_file(test_path, offset=2, limit=2)
+        assert result == "line2\nline3"
+
+        # offset=4, no limit → lines 4-5
+        result = sandbox.files.read_file(test_path, offset=4)
+        assert result == "line4\nline5"
+
+        # limit=2, no offset → lines 1-2
+        result = sandbox.files.read_file(test_path, limit=2)
+        assert result == "line1\nline2"
+
+        sandbox.files.delete_files([test_path])
 
     @pytest.mark.timeout(360)
     @pytest.mark.order(5)

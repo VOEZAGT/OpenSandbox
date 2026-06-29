@@ -1484,13 +1484,65 @@ class TestSandboxE2E:
             old_content="Appended line to file1",
             new_content="Replaced line in file1",
         )
-        await sandbox.files.replace_contents([replace_entry])
+        replace_results = await sandbox.files.replace_contents_detailed([replace_entry])
+        assert len(replace_results) == 1
+        assert replace_results[0].path == test_file1
+        assert replace_results[0].replaced_count == 1
         replaced_content1 = await sandbox.files.read_file(test_file1, encoding="utf-8")
         assert "Replaced line in file1" in replaced_content1
         assert "Appended line to file1" not in replaced_content1
 
         after_replace_info = (await sandbox.files.get_file_info([test_file1]))[test_file1]
         _assert_modified_updated(before_replace_info.modified_at, after_replace_info.modified_at, min_delta_ms=1)
+
+        logger.info("Step 8a: Replace with no match (replacedCount=0)")
+        no_match_results = await sandbox.files.replace_contents_detailed([
+            ContentReplaceEntry(
+                path=test_file1,
+                old_content="this string does not exist in file",
+                new_content="irrelevant",
+            )
+        ])
+        assert len(no_match_results) == 1
+        assert no_match_results[0].path == test_file1
+        assert no_match_results[0].replaced_count == 0
+        assert await sandbox.files.read_file(test_file1, encoding="utf-8") == replaced_content1
+
+        logger.info("Step 8b: Replace with multiple matches (replacedCount>1)")
+        multi_match_file = f"{test_dir1}/multi_match.txt"
+        await sandbox.files.write_files([WriteEntry(path=multi_match_file, data="foo bar foo baz foo")])
+        multi_results = await sandbox.files.replace_contents_detailed([
+            ContentReplaceEntry(path=multi_match_file, old_content="foo", new_content="qux")
+        ])
+        assert len(multi_results) == 1
+        assert multi_results[0].replaced_count == 3
+        assert await sandbox.files.read_file(multi_match_file, encoding="utf-8") == "qux bar qux baz qux"
+
+        logger.info("Step 8c: Batch replace across multiple files")
+        batch_file_a = f"{test_dir1}/batch_a.txt"
+        batch_file_b = f"{test_dir1}/batch_b.txt"
+        await sandbox.files.write_files([
+            WriteEntry(path=batch_file_a, data="hello world"),
+            WriteEntry(path=batch_file_b, data="hello hello"),
+        ])
+        batch_results = await sandbox.files.replace_contents_detailed([
+            ContentReplaceEntry(path=batch_file_a, old_content="hello", new_content="hi"),
+            ContentReplaceEntry(path=batch_file_b, old_content="hello", new_content="hi"),
+        ])
+        assert len(batch_results) == 2
+        results_by_path = {r.path: r.replaced_count for r in batch_results}
+        assert results_by_path[batch_file_a] == 1
+        assert results_by_path[batch_file_b] == 2
+        assert await sandbox.files.read_file(batch_file_a, encoding="utf-8") == "hi world"
+        assert await sandbox.files.read_file(batch_file_b, encoding="utf-8") == "hi hi"
+
+        await sandbox.files.delete_files([multi_match_file, batch_file_a, batch_file_b])
+
+        logger.info("Step 8d: Verify original replace_contents (no return value) still works")
+        await sandbox.files.replace_contents([
+            ContentReplaceEntry(path=test_file1, old_content="Replaced line in file1", new_content="Final line in file1")
+        ])
+        assert "Final line in file1" in await sandbox.files.read_file(test_file1, encoding="utf-8")
 
         logger.info("Step 9: Move/rename a file via API (move_files)")
         moved_path = f"{test_dir2}/moved_file3.txt"
@@ -1533,6 +1585,32 @@ class TestSandboxE2E:
         assert verify_dirs_deleted.logs.stdout[0].text == "OK"
 
         logger.info("TEST 3 PASSED: Basic filesystem operations test completed successfully")
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.order(4)
+    async def test_03a_line_based_file_reading(self):
+        """Test line-based file reading with offset and limit."""
+        await self._ensure_sandbox_created()
+        sandbox = TestSandboxE2E.sandbox
+
+        test_path = "/tmp/line-read-e2e.txt"
+        content = "line1\nline2\nline3\nline4\nline5"
+        sandbox_files = sandbox.files
+        await sandbox_files.write_files([WriteEntry(path=test_path, data=content)])
+
+        # offset=2, limit=2 → lines 2-3
+        result = await sandbox_files.read_file(test_path, offset=2, limit=2)
+        assert result == "line2\nline3"
+
+        # offset=4, no limit → lines 4-5
+        result = await sandbox_files.read_file(test_path, offset=4)
+        assert result == "line4\nline5"
+
+        # limit=2, no offset → lines 1-2
+        result = await sandbox_files.read_file(test_path, limit=2)
+        assert result == "line1\nline2"
+
+        await sandbox.files.delete_files([test_path])
 
     @pytest.mark.timeout(120)
     @pytest.mark.order(5)

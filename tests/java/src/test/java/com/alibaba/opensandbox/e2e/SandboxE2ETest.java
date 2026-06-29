@@ -1341,19 +1341,75 @@ public class SandboxE2ETest extends BaseE2ETest {
             Thread.sleep(50);
         } catch (InterruptedException ignored) {
         }
-        sandbox.files()
-                .replaceContents(
+        var replaceResults = sandbox.files()
+                .replaceContentsDetailed(
                         List.of(
                                 ContentReplaceEntry.builder()
                                         .path(testFile1)
                                         .oldContent("Appended line to file1")
                                         .newContent("Replaced line in file1")
                                         .build()));
+        assertEquals(1, replaceResults.size());
+        assertEquals(testFile1, replaceResults.get(0).getPath());
+        assertEquals(1, replaceResults.get(0).getReplacedCount());
         String replaced = sandbox.files().readFile(testFile1, "UTF-8", null);
         assertTrue(replaced.contains("Replaced line in file1"));
         assertFalse(replaced.contains("Appended line to file1"));
         EntryInfo afterReplace = sandbox.files().readFileInfo(List.of(testFile1)).get(testFile1);
         assertModifiedUpdated(beforeReplace.getModifiedAt(), afterReplace.getModifiedAt(), 1, 1000);
+
+        // No match → replacedCount=0
+        var noMatchResults = sandbox.files().replaceContentsDetailed(List.of(
+                ContentReplaceEntry.builder()
+                        .path(testFile1)
+                        .oldContent("nonexistent string")
+                        .newContent("irrelevant")
+                        .build()));
+        assertEquals(1, noMatchResults.size());
+        assertEquals(0, noMatchResults.get(0).getReplacedCount());
+
+        // Multiple matches
+        sandbox.files().write(List.of(
+                WriteEntry.builder().path(testDir1 + "/multi.txt").data("foo bar foo baz foo").build()));
+        var multiResults = sandbox.files().replaceContentsDetailed(List.of(
+                ContentReplaceEntry.builder()
+                        .path(testDir1 + "/multi.txt")
+                        .oldContent("foo")
+                        .newContent("qux")
+                        .build()));
+        assertEquals(1, multiResults.size());
+        assertEquals(3, multiResults.get(0).getReplacedCount());
+
+        // Batch replace across multiple files
+        String batchFileA = testDir1 + "/batch_a.txt";
+        String batchFileB = testDir1 + "/batch_b.txt";
+        sandbox.files().write(List.of(
+                WriteEntry.builder().path(batchFileA).data("hello world").build(),
+                WriteEntry.builder().path(batchFileB).data("hello hello").build()));
+        var batchResults = sandbox.files().replaceContentsDetailed(List.of(
+                ContentReplaceEntry.builder().path(batchFileA).oldContent("hello").newContent("hi").build(),
+                ContentReplaceEntry.builder().path(batchFileB).oldContent("hello").newContent("hi").build()));
+        assertEquals(2, batchResults.size());
+        var resultsByPath = batchResults.stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        ContentReplaceResult::getPath, ContentReplaceResult::getReplacedCount));
+        assertEquals(1, resultsByPath.get(batchFileA));
+        assertEquals(2, resultsByPath.get(batchFileB));
+        assertEquals("hi world", sandbox.files().readFile(batchFileA, "UTF-8", null));
+        assertEquals("hi hi", sandbox.files().readFile(batchFileB, "UTF-8", null));
+
+        // Verify original replaceContents (verbose=false, void return) still works
+        sandbox.files().replaceContents(List.of(
+                ContentReplaceEntry.builder()
+                        .path(testFile1)
+                        .oldContent("Replaced line in file1")
+                        .newContent("Final line in file1")
+                        .build()));
+        String finalContent = sandbox.files().readFile(testFile1, "UTF-8", null);
+        assertTrue(finalContent.contains("Final line in file1"));
+        assertFalse(finalContent.contains("Replaced line in file1"));
+
+        sandbox.files().deleteFiles(List.of(testDir1 + "/multi.txt", batchFileA, batchFileB));
 
         // Move file3
         String movedPath = testDir2 + "/moved_file3.txt";
@@ -1413,6 +1469,38 @@ public class SandboxE2ETest extends BaseE2ETest {
         assertNull(verify.getError());
         assertEquals(1, verify.getLogs().getStdout().size());
         assertEquals("OK", verify.getLogs().getStdout().get(0).getText());
+    }
+
+    @Test
+    @Order(5)
+    @DisplayName("Line-based file reading with offset and limit")
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
+    void testLineBasedFileReading() throws Exception {
+        assertNotNull(sandbox);
+
+        String testPath = "/tmp/line-read-e2e.txt";
+        String content = "line1\nline2\nline3\nline4\nline5";
+        sandbox.files()
+                .write(
+                        List.of(
+                                WriteEntry.builder()
+                                        .path(testPath)
+                                        .data(content)
+                                        .build()));
+
+        // offset=2, limit=2 → lines 2-3
+        String result1 = sandbox.files().readFile(testPath, "UTF-8", null, 2, 2);
+        assertEquals("line2\nline3", result1);
+
+        // offset=4, no limit → lines 4-5
+        String result2 = sandbox.files().readFile(testPath, "UTF-8", null, 4, null);
+        assertEquals("line4\nline5", result2);
+
+        // limit=2, no offset → lines 1-2
+        String result3 = sandbox.files().readFile(testPath, "UTF-8", null, null, 2);
+        assertEquals("line1\nline2", result3);
+
+        sandbox.files().deleteFiles(List.of(testPath));
     }
 
     @Test

@@ -62,41 +62,41 @@ record_env_selection() {
 	tmp_file=$(mktemp)
 
 	if [ -f "$BASHRC_FILE" ]; then
-		grep -vE "^source /opt/opensandbox/code-interpreter-env.sh ${lang}(\\s|$)" "$BASHRC_FILE" >"$tmp_file" || true
+		grep -vE "^source /opt/code-interpreter/code-interpreter-env.sh ${lang}(\\s|$)" "$BASHRC_FILE" >"$tmp_file" || true
 	else
 		: >"$tmp_file"
 	fi
 
-	echo "source /opt/opensandbox/code-interpreter-env.sh ${lang} ${version}" >>"$tmp_file"
+	echo "source /opt/code-interpreter/code-interpreter-env.sh ${lang} ${version}" >>"$tmp_file"
 	mv "$tmp_file" "$BASHRC_FILE"
 }
 
 if [ -n "${PYTHON_VERSION:-}" ]; then
-	source /opt/opensandbox/code-interpreter-env.sh python "${PYTHON_VERSION}"
+	source /opt/code-interpreter/code-interpreter-env.sh python "${PYTHON_VERSION}"
 	record_env_selection python "${PYTHON_VERSION}"
 else
-	source /opt/opensandbox/code-interpreter-env.sh python
+	source /opt/code-interpreter/code-interpreter-env.sh python
 fi
 
 if [ -n "${JAVA_VERSION:-}" ]; then
-	source /opt/opensandbox/code-interpreter-env.sh java "${JAVA_VERSION}"
+	source /opt/code-interpreter/code-interpreter-env.sh java "${JAVA_VERSION}"
 	record_env_selection java "${JAVA_VERSION}"
 else
-	source /opt/opensandbox/code-interpreter-env.sh java
+	source /opt/code-interpreter/code-interpreter-env.sh java
 fi
 
 if [ -n "${NODE_VERSION:-}" ]; then
-	source /opt/opensandbox/code-interpreter-env.sh node "${NODE_VERSION}"
+	source /opt/code-interpreter/code-interpreter-env.sh node "${NODE_VERSION}"
 	record_env_selection node "${NODE_VERSION}"
 else
-	source /opt/opensandbox/code-interpreter-env.sh node
+	source /opt/code-interpreter/code-interpreter-env.sh node
 fi
 
 if [ -n "${GO_VERSION:-}" ]; then
-	source /opt/opensandbox/code-interpreter-env.sh go "${GO_VERSION}"
+	source /opt/code-interpreter/code-interpreter-env.sh go "${GO_VERSION}"
 	record_env_selection go "${GO_VERSION}"
 else
-	source /opt/opensandbox/code-interpreter-env.sh go
+	source /opt/code-interpreter/code-interpreter-env.sh go
 fi
 
 setup_python() {
@@ -112,11 +112,27 @@ setup_java() {
 	}
 }
 
+tslab_kernels_installed() {
+	local kernels
+	kernels=$(jupyter kernelspec list 2>/dev/null)
+	grep -Eq '^[[:space:]]+tslab[[:space:]]' <<<"$kernels" && grep -Eq '^[[:space:]]+jslab[[:space:]]' <<<"$kernels"
+}
+
+ensure_tslab_command() {
+	if command -v tslab >/dev/null 2>&1; then
+		return
+	fi
+
+	npm install -g tslab
+}
+
 # setup node
 setup_node() {
 	time {
-		npm install -g tslab
-		tslab install
+		ensure_tslab_command
+		if ! tslab_kernels_installed; then
+			tslab install
+		fi
 	}
 }
 
@@ -151,4 +167,4 @@ pids+=($!)
 setup_bash &
 pids+=($!)
 
-jupyter notebook --ip=127.0.0.1 --port="${JUPYTER_PORT:-44771}" --allow-root --no-browser --NotebookApp.token="${JUPYTER_TOKEN:-opensandboxcodeinterpreterjupyter}" >/opt/opensandbox/jupyter.log
+jupyter notebook --ip=127.0.0.1 --port="${JUPYTER_PORT:-44771}" --allow-root --no-browser --NotebookApp.token="${JUPYTER_TOKEN:-opensandboxcodeinterpreterjupyter}" >/opt/code-interpreter/jupyter.log

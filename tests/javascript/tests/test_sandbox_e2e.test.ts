@@ -906,16 +906,62 @@ test("03 filesystem operations: CRUD + replace/move/delete + range + stream", as
   expect(await sandbox.files.readFile(file2)).toBe(updated2);
 
   await new Promise((r) => setTimeout(r, 50));
-  await sandbox.files.replaceContents([
+  const replaceResults = await sandbox.files.replaceContentsDetailed([
     {
       path: file1,
       oldContent: "Appended line to file1",
       newContent: "Replaced line in file1",
     },
   ]);
+  expect(replaceResults.length).toBe(1);
+  expect(replaceResults[0].path).toBe(file1);
+  expect(replaceResults[0].replacedCount).toBe(1);
   const replaced = await sandbox.files.readFile(file1);
   expect(replaced.includes("Replaced line in file1")).toBe(true);
   expect(replaced.includes("Appended line to file1")).toBe(false);
+
+  // Replace with no match (replacedCount=0)
+  const noMatchResults = await sandbox.files.replaceContentsDetailed([
+    { path: file1, oldContent: "this string does not exist", newContent: "irrelevant" },
+  ]);
+  expect(noMatchResults.length).toBe(1);
+  expect(noMatchResults[0].path).toBe(file1);
+  expect(noMatchResults[0].replacedCount).toBe(0);
+  expect(await sandbox.files.readFile(file1)).toBe(replaced);
+
+  // Replace with multiple matches (replacedCount>1)
+  const multiFile = `${dir1}/multi_match.txt`;
+  await sandbox.files.writeFiles([{ path: multiFile, data: "foo bar foo baz foo" }]);
+  const multiResults = await sandbox.files.replaceContentsDetailed([
+    { path: multiFile, oldContent: "foo", newContent: "qux" },
+  ]);
+  expect(multiResults.length).toBe(1);
+  expect(multiResults[0].replacedCount).toBe(3);
+  expect(await sandbox.files.readFile(multiFile)).toBe("qux bar qux baz qux");
+
+  // Batch replace across multiple files
+  const batchA = `${dir1}/batch_a.txt`;
+  const batchB = `${dir1}/batch_b.txt`;
+  await sandbox.files.writeFiles([
+    { path: batchA, data: "hello world" },
+    { path: batchB, data: "hello hello" },
+  ]);
+  const batchResults = await sandbox.files.replaceContentsDetailed([
+    { path: batchA, oldContent: "hello", newContent: "hi" },
+    { path: batchB, oldContent: "hello", newContent: "hi" },
+  ]);
+  expect(batchResults.length).toBe(2);
+  const byPath = Object.fromEntries(batchResults.map((r) => [r.path, r.replacedCount]));
+  expect(byPath[batchA]).toBe(1);
+  expect(byPath[batchB]).toBe(2);
+  expect(await sandbox.files.readFile(batchA)).toBe("hi world");
+  expect(await sandbox.files.readFile(batchB)).toBe("hi hi");
+
+  // Verify original replaceContents (void return) still works
+  await sandbox.files.replaceContents([
+    { path: file1, oldContent: "Replaced line in file1", newContent: "Final line in file1" },
+  ]);
+  expect((await sandbox.files.readFile(file1)).includes("Final line in file1")).toBe(true);
 
   const movedPath = `${dir2}/moved_file3.txt`;
   await sandbox.files.moveFiles([{ src: file3, dest: movedPath }]);
@@ -939,6 +985,28 @@ test("03 filesystem operations: CRUD + replace/move/delete + range + stream", as
   }
   expect(verify.error).toBeUndefined();
   expect(verify.logs.stdout[0]?.text).toBe("OK");
+});
+
+test("03a line-based file reading with offset and limit", async () => {
+  if (!sandbox) throw new Error("sandbox not created");
+
+  const testPath = "/tmp/line-read-e2e.txt";
+  const content = "line1\nline2\nline3\nline4\nline5";
+  await sandbox.files.writeFiles([{ path: testPath, data: content }]);
+
+  // offset=2, limit=2 → lines 2-3
+  const result1 = await sandbox.files.readFile(testPath, { offset: 2, limit: 2 });
+  expect(result1).toBe("line2\nline3");
+
+  // offset=4, no limit → lines 4-5
+  const result2 = await sandbox.files.readFile(testPath, { offset: 4 });
+  expect(result2).toBe("line4\nline5");
+
+  // limit=2, no offset → lines 1-2
+  const result3 = await sandbox.files.readFile(testPath, { limit: 2 });
+  expect(result3).toBe("line1\nline2");
+
+  await sandbox.files.deleteFiles([testPath]);
 });
 
 test("04 interrupt command", async () => {

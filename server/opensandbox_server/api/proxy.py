@@ -33,7 +33,7 @@ from websockets.typing import Origin
 from opensandbox_server.api import lifecycle
 from opensandbox_server.api.schema import Endpoint
 from opensandbox_server.middleware.auth import SANDBOX_API_KEY_HEADER
-from opensandbox_server.services.constants import OPEN_SANDBOX_SECURE_ACCESS_HEADER
+from opensandbox_server.services.constants import OPEN_SANDBOX_EGRESS_AUTH_HEADER, OPEN_SANDBOX_SECURE_ACCESS_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +118,15 @@ def _filter_proxy_headers(
             forwarded[key] = value
 
     if endpoint_headers:
+        endpoint_header_excluded = {
+            OPEN_SANDBOX_SECURE_ACCESS_HEADER.lower(),
+            OPEN_SANDBOX_EGRESS_AUTH_HEADER.lower(),
+        }
         forwarded.update(
             {
                 key: value
                 for key, value in endpoint_headers.items()
-                if key.lower() != OPEN_SANDBOX_SECURE_ACCESS_HEADER.lower()
+                if key.lower() not in endpoint_header_excluded
             }
         )
     return forwarded
@@ -136,13 +140,14 @@ def _schedule_proxy_renew(request: Request | WebSocket, sandbox_id: str) -> None
 
 async def _stream_backend_response(resp: httpx.Response) -> AsyncIterator[bytes]:
     """
-    Yield backend body chunks and always close the httpx streaming response.
+    Yield backend body chunks without httpx content decoding and always close the response.
 
     httpx requires ``await resp.aclose()`` for ``stream=True`` responses so connections
     return to the pool; Starlette's StreamingResponse does not do this automatically.
+    Use ``aiter_raw`` so forwarded ``content-encoding`` headers still match the body bytes.
     """
     try:
-        async for chunk in resp.aiter_bytes():
+        async for chunk in resp.aiter_raw():
             yield chunk
     finally:
         await resp.aclose()

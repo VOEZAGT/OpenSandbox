@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -60,6 +61,10 @@ type Proxy struct {
 	onResolved func(domain string, ips []nftables.ResolvedIP)
 	// Optional: async fan-out for denied lookups (e.g. webhook).
 	blockedBroadcaster *events.Broadcaster
+
+	// Hosts whose successful outbound DNS log line should be suppressed (audit
+	// errors are still logged). Loaded once at startup; nil means "log all".
+	logSkip atomic.Pointer[policy.DomainSet]
 }
 
 // New constructs the DNS proxy: discovers upstreams, default listen 127.0.0.1:15353 if listenAddr is "".
@@ -118,9 +123,11 @@ func (p *Proxy) Start(ctx context.Context) error {
 	tcpServer := &dns.Server{Addr: p.listenAddr, Net: "tcp", Handler: handler}
 	p.servers = []*dns.Server{udpServer, tcpServer}
 
+	readyCh := make(chan struct{}, len(p.servers))
 	errCh := make(chan error, len(p.servers))
 	for _, srv := range p.servers {
 		s := srv
+		s.NotifyStartedFunc = func() { readyCh <- struct{}{} }
 		safego.Go(func() {
 			if err := s.ListenAndServe(); err != nil {
 				errCh <- err
@@ -128,13 +135,13 @@ func (p *Proxy) Start(ctx context.Context) error {
 		})
 	}
 
-	timer := time.NewTimer(200 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case err := <-errCh:
-		return fmt.Errorf("dns proxy failed: %w", err)
-	case <-timer.C:
-		// Start upstream probes only after listeners are up, so the first probe does not fail on "not listening".
+	// Wait for all servers (UDP + TCP) to bind, or fail fast on error.
+	for i := 0; i < len(p.servers); i++ {
+		select {
+		case err := <-errCh:
+			return fmt.Errorf("dns proxy failed: %w", err)
+		case <-readyCh:
+		}
 	}
 
 	safego.Go(func() { p.runUpstreamProbes(ctx) })
@@ -182,16 +189,32 @@ func (p *Proxy) serveDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if err != nil {
 		telemetry.RecordDNSForward(elapsed)
 		logOutboundDNS(host, nil, "", err.Error())
-		log.Warnf("[dns] forward error for %s: %v", domain, err)
 		fail := new(dns.Msg)
 		fail.SetRcode(r, dns.RcodeServerFailure)
 		_ = w.WriteMsg(fail)
 		return
 	}
 	telemetry.RecordDNSForward(elapsed)
-	logOutboundDNS(host, resolvedIPStrings(resp), "", "")
+	if !p.shouldSkipOutboundLog(host) {
+		logOutboundDNS(host, resolvedIPStrings(resp), "", "")
+	}
 	p.maybeNotifyResolved(domain, resp)
 	_ = w.WriteMsg(resp)
+}
+
+// SetLogSkip replaces the set of hosts whose successful DNS outbound log line
+// is suppressed. Passing nil or an empty slice restores the default of logging
+// every outbound. Safe to call concurrently; reads use an atomic pointer.
+func (p *Proxy) SetLogSkip(patterns []string) {
+	p.logSkip.Store(policy.NewDomainSet(patterns))
+}
+
+func (p *Proxy) shouldSkipOutboundLog(host string) bool {
+	ds := p.logSkip.Load()
+	if ds == nil || ds.Empty() {
+		return false
+	}
+	return ds.Match(host)
 }
 
 // maybeNotifyResolved calls onResolved before w.WriteMsg so dynamic nft allows are installed
@@ -211,11 +234,17 @@ func (p *Proxy) forward(r *dns.Msg) (*dns.Msg, error) {
 	list := p.forwardUpstreams()
 	var lastErr error
 	for _, upstream := range list {
+		const upstreamUDPSize = 4096
+		query := r.Copy()
+		if query.IsEdns0() == nil {
+			query.SetEdns0(upstreamUDPSize, false)
+		}
 		c := &dns.Client{
 			Timeout: p.upstreamExchangeTimeout,
 			Dialer:  p.dialerForUpstream(upstream),
+			UDPSize: upstreamUDPSize,
 		}
-		resp, _, err := c.Exchange(r, upstream)
+		resp, _, err := c.Exchange(query, upstream)
 		if err != nil {
 			lastErr = err
 			log.Warnf("[dns] upstream %s exchange error: %v", upstream, err)

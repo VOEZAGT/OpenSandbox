@@ -689,14 +689,14 @@ export interface paths {
         get: {
             parameters: {
                 query?: {
-                    /** @description Whether to return a server-proxied URL */
+                    /** @description Whether to return a server-proxied URL. Cannot be combined with `expires`. */
                     use_server_proxy?: boolean;
                     /**
                      * @description Optional. When set, the server **issues a signed** access route (OSEP-0011). The value
                      *     is **Linux / Unix epoch seconds** — a decimal `uint64` count of **whole seconds** since
                      *     the Unix epoch (`1970-01-01 00:00:00` UTC, same as POSIX / `time(2)`), not
                      *     milliseconds. Normalized to `expires_b36` for the four-segment route token. Omit to
-                     *     get the unsigned/legacy response shape.
+                     *     get the unsigned/legacy response shape. Cannot be combined with `use_server_proxy=true`.
                      */
                     expires?: string;
                 };
@@ -1008,12 +1008,20 @@ export interface components {
             [key: string]: string | null;
         };
         /**
-         * @description Request to create a new sandbox from either a container image or a snapshot.
-         *     Exactly one of `image` or `snapshotId` must be provided.
+         * @description Request to create a new sandbox from either a container image, a snapshot,
+         *     or a pre-configured pool (via `extensions.poolRef`).
+         *
+         *     **Standard mode**: Exactly one of `image` or `snapshotId` must be provided,
+         *     and `resourceLimits` is required.
          *
          *     When `image` is provided, `entrypoint` is required. When `snapshotId` is
          *     provided, `entrypoint` is optional. If omitted, the server defaults the
          *     sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
+         *
+         *     **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
+         *     a pre-configured pool. In this case `image`, `entrypoint`, and
+         *     `resourceLimits` are all optional (defined by the Pool CRD template).
+         *     `snapshotId` must not be provided together with `poolRef`.
          *
          *     **Note**: API Key authentication is required via the `OPEN-SANDBOX-API-KEY` header.
          */
@@ -1046,10 +1054,21 @@ export interface components {
              */
             timeout?: number | null;
             /**
-             * @description Runtime resource constraints for the sandbox instance.
+             * @description Runtime resource constraints (hard caps) for the sandbox instance.
+             *     Required when `extensions.poolRef` is not set.
+             *     Optional when using pool mode (resource limits are defined by the Pool CRD template).
              *     SDK clients should provide sensible defaults (e.g., cpu: "500m", memory: "512Mi").
              */
-            resourceLimits: components["schemas"]["ResourceLimits"];
+            resourceLimits?: components["schemas"]["ResourceLimits"];
+            /**
+             * @description Resource reservations (guaranteed minimums) for the sandbox instance.
+             *     When provided, these values are used as Kubernetes resource `requests`,
+             *     enabling Burstable QoS class (where `requests < limits`).
+             *     When omitted, `resourceLimits` values are used for both limits and requests,
+             *     resulting in Guaranteed QoS class.
+             *     Only meaningful for Kubernetes-based runtimes; ignored by Docker runtime.
+             */
+            resourceRequests?: components["schemas"]["ResourceLimits"];
             /**
              * @description Environment variables to inject into the sandbox runtime.
              * @example {
@@ -1104,6 +1123,13 @@ export interface components {
              *     the sidecar starts in allow-all mode until updated.
              */
             networkPolicy?: components["schemas"]["NetworkPolicy"];
+            /**
+             * @description Optional Credential Vault proxy startup settings. Set `enabled: true`
+             *     to enable transparent MITM support for credential injection. Plain
+             *     `networkPolicy` does not enable transparent MITM unless this option
+             *     is set.
+             */
+            credentialProxy?: components["schemas"]["CredentialProxyConfig"];
             /**
              * @description Opts the sandbox into secured access for endpoint access.
              *     This is currently supported only for Kubernetes sandboxes exposed
@@ -1217,6 +1243,20 @@ export interface components {
             /** @description List of egress rules evaluated in order. */
             egress?: components["schemas"]["NetworkRule"][];
         };
+        /**
+         * @description Credential Vault proxy startup settings. This is an explicit opt-in for
+         *     transparent MITM support used by credential injection; plain egress
+         *     network policy remains DNS/FQDN policy enforcement only.
+         */
+        CredentialProxyConfig: {
+            /**
+             * @description When true, the server starts the egress sidecar with transparent
+             *     MITM enabled and installs the runtime-managed MITM CA bundle into
+             *     the sandbox container. Requires `networkPolicy`.
+             * @default false
+             */
+            enabled: boolean;
+        };
         NetworkRule: {
             /**
              * @description Whether to allow or deny matching targets.
@@ -1302,9 +1342,9 @@ export interface components {
             /**
              * @description When true, the volume is automatically removed when the sandbox
              *     is deleted. Only applies to volumes that were auto-created by the
-             *     server (Docker only). Pre-existing volumes are never removed.
-             *     Has no effect on Kubernetes PVCs, whose lifecycle is managed by
-             *     the StorageClass reclaim policy.
+             *     server on this request; pre-existing volumes are never removed.
+             *     For Kubernetes, the resulting PVC delete triggers the bound PV's
+             *     StorageClass reclaim policy (`Retain`/`Delete`).
              * @default false
              */
             deleteOnSandboxTermination: boolean;

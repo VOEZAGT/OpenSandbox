@@ -21,15 +21,20 @@ from opensandbox.pool_async import AsyncSandboxPool, SandboxPoolAsync
 from opensandbox.pool_types import (
     AcquirePolicy,
     AsyncPoolConfig,
+    AsyncPooledSandboxCreator,
     AsyncPoolStateStore,
     IdleEntry,
     PoolConfig,
     PoolCreationSpec,
+    PooledSandboxCreateContext,
+    PooledSandboxCreateReason,
+    PooledSandboxCreator,
     PoolLifecycleState,
     PoolSnapshot,
     PoolState,
     PoolStateStore,
     StoreCounters,
+    TakeIdleResult,
 )
 from opensandbox.sync.pool import SandboxPoolSync
 
@@ -37,12 +42,16 @@ SandboxPool = SandboxPoolSync
 
 __all__ = [
     "AcquirePolicy",
+    "AsyncPooledSandboxCreator",
     "AsyncPoolConfig",
     "AsyncPoolStateStore",
     "AsyncSandboxPool",
     "IdleEntry",
     "InMemoryAsyncPoolStateStore",
     "InMemoryPoolStateStore",
+    "PooledSandboxCreateContext",
+    "PooledSandboxCreateReason",
+    "PooledSandboxCreator",
     "PoolConfig",
     "PoolCreationSpec",
     "PoolLifecycleState",
@@ -53,4 +62,5 @@ __all__ = [
     "SandboxPool",
     "SandboxPoolSync",
     "StoreCounters",
+    "TakeIdleResult",
 ]
